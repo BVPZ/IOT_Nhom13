@@ -2,6 +2,7 @@ import os
 import ssl
 import json
 import time
+import asyncio
 from datetime import datetime, timedelta
 from typing import Optional, List
 
@@ -14,7 +15,8 @@ from dotenv import load_dotenv
 from fastapi import FastAPI, Depends, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
+from telegram_notifier import send_telegram_alert
 
 # Đọc biến môi trường từ file .env (Mục 4.5)
 load_dotenv()
@@ -119,6 +121,34 @@ mqtt_client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
 last_saved_cache = {}
 last_retention_cleanup = {}
 
+async def send_telegram_notifications(notifications):
+    await asyncio.gather(*(send_telegram_alert(*notification) for notification in notifications))
+
+def create_threshold_alert(cursor, notifications, device, alert_type, severity, metric_name, current_value, threshold_value, unit):
+    if current_value < threshold_value:
+        return
+
+    cursor.execute(
+        "SELECT id FROM alerts WHERE device_id = %s AND alert_type = %s AND status = 'NEW' LIMIT 1",
+        (device["id"], alert_type)
+    )
+    if cursor.fetchone():
+        return
+
+    message = (
+        f"{metric_name} vuot nguong "
+        f"({current_value} {unit} >= {threshold_value} {unit})"
+    )
+    cursor.execute(
+        """INSERT INTO alerts (device_id, alert_type, severity, message, measured_value, threshold_value)
+           VALUES (%s, %s, %s, %s, %s, %s)""",
+        (device["id"], alert_type, severity, message, current_value, threshold_value)
+    )
+    notifications.append(
+        (device["device_code"], metric_name, current_value, threshold_value, unit)
+    )
+    print(f"[ALERT] {device['device_code']}: {alert_type} threshold exceeded")
+
 def on_connect(client, userdata, flags, reason_code, properties):
     if reason_code == 0:
         print(f"[MQTT BACKEND] Da ket noi toi EMQX Broker ({MQTT_BROKER})!")
@@ -130,6 +160,7 @@ def on_connect(client, userdata, flags, reason_code, properties):
 
 def on_message(client, userdata, msg):
     topic = msg.topic
+    telegram_notifications = []
     try:
         payload = json.loads(msg.payload.decode("utf-8"))
     except Exception as e:
@@ -219,25 +250,18 @@ def on_message(client, userdata, msg):
                     (new_lifecycle, device["id"])
                 )
 
-                if eco2 > device["eco2_threshold"]:
-                    cursor.execute(
-                        "SELECT id FROM alerts WHERE device_id = %s AND alert_type = 'HIGH_ECO2' AND status = 'NEW' LIMIT 1",
-                        (device["id"],)
-                    )
-                    if not cursor.fetchone():
-                        cursor.execute(
-                            """INSERT INTO alerts (device_id, alert_type, severity, message, measured_value, threshold_value)
-                               VALUES (%s, 'HIGH_ECO2', 'CRITICAL', %s, %s, %s)""",
-                            (device["id"], f"Nong do eCO2 vuot nguong ({eco2} ppm > {device['eco2_threshold']} ppm)", eco2, device["eco2_threshold"])
-                        )
-                        print(f"[ALERT] CANH BAO DO MOI: eCO2 = {eco2} ppm vuot nguong!")
-
-                if temp > device["temp_threshold"]:
-                    cursor.execute(
-                        """INSERT INTO alerts (device_id, alert_type, severity, message, measured_value, threshold_value)
-                           VALUES (%s, 'HIGH_TEMP', 'WARNING', %s, %s, %s)""",
-                        (device["id"], f"Nhiet do phong vuot nguong ({temp} C > {device['temp_threshold']} C)", temp, device["temp_threshold"])
-                    )
+                create_threshold_alert(
+                    cursor, telegram_notifications, device, "HIGH_ECO2", "CRITICAL",
+                    "eCO2", eco2, device["eco2_threshold"], "ppm"
+                )
+                create_threshold_alert(
+                    cursor, telegram_notifications, device, "HIGH_TVOC", "WARNING",
+                    "TVOC", tvoc, device["tvoc_threshold"], "ppb"
+                )
+                create_threshold_alert(
+                    cursor, telegram_notifications, device, "HIGH_TEMP", "WARNING",
+                    "Nhiệt độ", temp, device["temp_threshold"], "°C"
+                )
 
                 conn.commit()
                 if should_save_db:
@@ -260,7 +284,7 @@ def on_message(client, userdata, msg):
                         "UPDATE devices SET is_online = %s, lifecycle_status = %s, firmware_version = %s, last_seen_at = NOW() WHERE id = %s",
                         (is_online, new_lifecycle, fw_ver, device["id"])
                     )
-                    if not is_online:
+                    if not is_online and device["is_online"]:
                         cursor.execute(
                             """INSERT INTO alerts (device_id, alert_type, severity, message, measured_value, threshold_value)
                                VALUES (%s, 'DEVICE_OFFLINE', 'WARNING', %s, 0, 0)""",
@@ -274,14 +298,29 @@ def on_message(client, userdata, msg):
                 cmd_code = payload.get("cmd_code")
                 ack_status = payload.get("status", "SUCCESS")
                 ack_msg = payload.get("message", "")
+                device_code = payload.get("device_code")
                 cursor.execute(
                     "UPDATE command_logs SET status = %s, ack_message = %s, acked_at = NOW() WHERE cmd_code = %s",
                     (ack_status, ack_msg, cmd_code)
                 )
+                if device_code:
+                    cursor.execute(
+                        """UPDATE devices
+                           SET is_online = 1,
+                               lifecycle_status = CASE
+                                   WHEN lifecycle_status IN ('REGISTERED', 'PROVISIONED', 'OFFLINE') THEN 'ACTIVE'
+                                   ELSE lifecycle_status
+                               END,
+                               last_seen_at = NOW()
+                           WHERE device_code = %s AND lifecycle_status != 'DECOMMISSIONED'""",
+                        (device_code,)
+                    )
                 conn.commit()
                 print(f"[COMMAND ACK] Lenh {cmd_code} da duoc ESP32 xac nhan: {ack_status} ({ack_msg})")
 
         conn.close()
+        if telegram_notifications:
+            asyncio.run(send_telegram_notifications(telegram_notifications))
     except Exception as e:
         print(f"[DB WORKER ERROR] {e}")
 
@@ -300,10 +339,56 @@ def start_mqtt_worker():
     except Exception as e:
         print(f"[MQTT ERROR] Khong the ket noi EMQX: {e}")
 
+def mark_stale_devices_offline():
+    conn = get_db()
+    try:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """SELECT id, device_code, lifecycle_status
+                   FROM devices
+                   WHERE is_online = 1
+                     AND lifecycle_status != 'DECOMMISSIONED'
+                     AND (last_seen_at IS NULL OR last_seen_at < DATE_SUB(NOW(), INTERVAL 30 SECOND))"""
+            )
+            stale_devices = cursor.fetchall()
+
+            for device in stale_devices:
+                cursor.execute(
+                    """UPDATE devices
+                       SET is_online = 0,
+                           lifecycle_status = CASE
+                               WHEN lifecycle_status = 'ACTIVE' THEN 'OFFLINE'
+                               ELSE lifecycle_status
+                           END
+                       WHERE id = %s AND is_online = 1
+                         AND (last_seen_at IS NULL OR last_seen_at < DATE_SUB(NOW(), INTERVAL 30 SECOND))""",
+                    (device["id"],)
+                )
+                if cursor.rowcount:
+                    cursor.execute(
+                        """INSERT INTO alerts (device_id, alert_type, severity, message, measured_value, threshold_value)
+                           VALUES (%s, 'DEVICE_OFFLINE', 'WARNING', %s, 0, 0)""",
+                        (device["id"], f"Thiet bi {device['device_code']} khong gui MQTT trong hon 30 giay")
+                    )
+                    print(f"[WATCHDOG] {device['device_code']} offline: no MQTT message for over 30 seconds")
+
+        conn.commit()
+    finally:
+        conn.close()
+
+async def monitor_device_heartbeats():
+    while True:
+        try:
+            await asyncio.to_thread(mark_stale_devices_offline)
+        except Exception as error:
+            print(f"[WATCHDOG ERROR] Khong the kiem tra heartbeat thiet bi: {error}")
+        await asyncio.sleep(5)
+
 @app.on_event("startup")
 def startup_event():
     init_db()
     start_mqtt_worker()
+    asyncio.create_task(monitor_device_heartbeats())
 
 # =========================================================================
 # 3. XÁC THỰC JWT & PHÂN QUYỀN RBAC 3 VAI TRÒ (Mục 4.4a & 4.5)
@@ -337,9 +422,10 @@ class CommandRequest(BaseModel):
     action: str
 
 class ConfigRequest(BaseModel):
-    send_interval_ms: int
+    send_interval_ms: int = Field(ge=1000, le=60000)
     eco2_threshold: float
     temp_threshold: float
+    tvoc_threshold: Optional[float] = None
 
 class LifecycleRequest(BaseModel):
     lifecycle_status: str
@@ -480,26 +566,60 @@ def update_remote_config(device_code: str, req: ConfigRequest, user: dict = Depe
             raise HTTPException(status_code=404, detail="Khong tim thay thiet bi")
 
         cmd_code = f"CFG_{int(time.time() * 1000)}"
+        tvoc_threshold = (
+            req.tvoc_threshold
+            if req.tvoc_threshold is not None
+            else device["tvoc_threshold"]
+        )
         payload = {
             "cmd_code": cmd_code,
             "send_interval_ms": req.send_interval_ms,
-            "eco2_threshold": req.eco2_threshold
+            "eco2_threshold": req.eco2_threshold,
+            "tvoc_threshold": tvoc_threshold,
+            "temp_threshold": req.temp_threshold
         }
-        mqtt_client.publish(f"iot_nhom13/{device_code}/config", json.dumps(payload), qos=1)
+        publish_info = mqtt_client.publish(
+            f"iot_nhom13/{device_code}/config",
+            json.dumps(payload),
+            qos=1,
+            retain=True
+        )
+        publish_succeeded = publish_info.rc == mqtt.MQTT_ERR_SUCCESS
 
         cursor.execute(
-            "UPDATE devices SET send_interval_ms = %s, eco2_threshold = %s, temp_threshold = %s WHERE device_code = %s",
-            (req.send_interval_ms, req.eco2_threshold, req.temp_threshold, device_code)
+            "UPDATE devices SET send_interval_ms = %s, eco2_threshold = %s, temp_threshold = %s, tvoc_threshold = %s WHERE device_code = %s",
+            (req.send_interval_ms, req.eco2_threshold, req.temp_threshold, tvoc_threshold, device_code)
         )
         cursor.execute(
             """INSERT INTO command_logs (cmd_code, device_id, issued_by, target_actuator, command_action, payload_json, status)
-               VALUES (%s, %s, %s, 'REMOTE_CONFIG', 'UPDATE_CONFIG', %s, 'PENDING')""",
-            (cmd_code, device["id"], user["user_id"], json.dumps(payload))
+               VALUES (%s, %s, %s, 'REMOTE_CONFIG', 'UPDATE_CONFIG', %s, %s)""",
+            (
+                cmd_code, device["id"], user["user_id"], json.dumps(payload),
+                "PENDING" if publish_succeeded else "FAILED"
+            )
         )
     conn.commit()
     conn.close()
-    log_audit(user["user_id"], "UPDATE_CONFIG", f"DEVICE:{device_code}", f"Cap nhat chu ky {req.send_interval_ms}ms, nguong eCO2 {req.eco2_threshold}ppm")
-    return {"message": "Da gui cau hinh tu xa xuong ESP32", "cmd_code": cmd_code}
+    log_audit(
+        user["user_id"], "UPDATE_CONFIG", f"DEVICE:{device_code}",
+        f"Cap nhat chu ky {req.send_interval_ms}ms, nguong eCO2 {req.eco2_threshold}ppm, "
+        f"TVOC {tvoc_threshold}ppb, nhiet do {req.temp_threshold}C"
+    )
+    return {
+        "message": (
+            "Backend da luu cau hinh; MQTT da xep lenh retained de dong bo ESP32"
+            if publish_succeeded
+            else "Backend da luu cau hinh nhung MQTT chua gui duoc lenh; ESP32 chua duoc dong bo"
+        ),
+        "cmd_code": cmd_code,
+        "device_sync_queued": publish_succeeded,
+        "config": {
+            "send_interval_ms": req.send_interval_ms,
+            "eco2_threshold": req.eco2_threshold,
+            "tvoc_threshold": tvoc_threshold,
+            "temp_threshold": req.temp_threshold
+        }
+    }
 
 @app.get("/api/commands")
 def list_commands(user: dict = Depends(get_current_user)):

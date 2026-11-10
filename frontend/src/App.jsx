@@ -45,6 +45,27 @@ export default function App() {
 
   const authHeader = { headers: { Authorization: `Bearer ${token}` } };
   const mqttClientRef = useRef(null);
+  const lastLoadedConfigRef = useRef('');
+
+  useEffect(() => {
+    const device = devices.find(item => item.device_code === selectedDevice);
+    if (!device) return;
+
+    const configVersion = [
+      selectedDevice,
+      device.send_interval_ms,
+      device.eco2_threshold,
+      device.temp_threshold,
+      device.tvoc_threshold
+    ].join(':');
+    if (lastLoadedConfigRef.current === configVersion) return;
+    lastLoadedConfigRef.current = configVersion;
+
+    setSendInterval(device.send_interval_ms ?? 5000);
+    setEco2Threshold(device.eco2_threshold ?? 1500);
+    setTempThreshold(device.temp_threshold ?? 35);
+    setTvocThreshold(device.tvoc_threshold ?? 600);
+  }, [devices, selectedDevice]);
 
   // 1. XỬ LÝ ĐĂNG NHẬP / ĐĂNG XUẤT
   const handleLogin = async (e) => {
@@ -175,6 +196,25 @@ export default function App() {
     };
   }, [token, selectedDevice]);
 
+  useEffect(() => {
+    if (!token) return undefined;
+
+    const refreshDeviceStatus = async () => {
+      try {
+        const response = await axios.get(`${API_BASE}/devices`, {
+          headers: { Authorization: `Bearer ${token}` }
+        });
+        setDevices(response.data);
+      } catch (err) {
+        if (err.response?.status === 401) handleLogout();
+        else console.error('Không thể cập nhật trạng thái thiết bị:', err);
+      }
+    };
+
+    const intervalId = window.setInterval(refreshDeviceStatus, 5000);
+    return () => window.clearInterval(intervalId);
+  }, [token]);
+
   // 4. ĐIỀU KHIỂN & CẤU HÌNH THIẾT BỊ
   const handleCommand = async (action) => {
     setActionMsg('Đang gửi lệnh tới ESP32...');
@@ -199,6 +239,18 @@ export default function App() {
         temp_threshold: Number(tempThreshold),
         tvoc_threshold: Number(tvocThreshold) // Gửi ngưỡng TVOC
       }, authHeader);
+      const savedConfig = res.data.config;
+      if (savedConfig) {
+        setSendInterval(savedConfig.send_interval_ms);
+        setEco2Threshold(savedConfig.eco2_threshold);
+        setTempThreshold(savedConfig.temp_threshold);
+        setTvocThreshold(savedConfig.tvoc_threshold);
+        setDevices(prev => prev.map(device => (
+          device.device_code === selectedDevice
+            ? { ...device, ...savedConfig }
+            : device
+        )));
+      }
       setActionMsg(`Thành công: ${res.data.message || 'Đã áp dụng cấu hình'}`);
     } catch (err) {
       setActionMsg(`Lỗi: ${err.response?.data?.detail || 'Không thể cập nhật'}`);
@@ -304,7 +356,7 @@ export default function App() {
           {/* Trạng thái kết nối WebSocket MQTT */}
           <div className="flex items-center gap-1.5 text-xs bg-slate-800 border border-slate-700 px-3 py-1 rounded">
             <Wifi className={`w-3.5 h-3.5 ${mqttStatus === 'CONNECTED' ? 'text-emerald-400' : 'text-amber-400'}`} />
-            <span>MQTT Cloud: </span>
+            <span title="Kết nối MQTT của trình duyệt dashboard, không phải trạng thái online của ESP32">MQTT Web: </span>
             <strong className={mqttStatus === 'CONNECTED' ? 'text-emerald-400' : 'text-amber-400'}>
               {mqttStatus}
             </strong>
