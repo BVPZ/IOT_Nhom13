@@ -130,10 +130,18 @@ async def send_telegram_notifications(notifications):
 
 def create_threshold_alert(cursor, notifications, device, alert_type, severity, metric_name, current_value, threshold_value, unit):
     if current_value < threshold_value:
+        cursor.execute(
+            """UPDATE alerts SET status = 'RESOLVED', resolve_note = 'Chi so da tro lai muc an toan'
+               WHERE device_id = %s AND alert_type = %s AND status IN ('NEW', 'ACKNOWLEDGED')""",
+            (device["id"], alert_type)
+        )
         return
 
     cursor.execute(
-        "SELECT id FROM alerts WHERE device_id = %s AND alert_type = %s AND status = 'NEW' LIMIT 1",
+        """SELECT id FROM alerts
+           WHERE device_id = %s AND alert_type = %s
+             AND status IN ('NEW', 'ACKNOWLEDGED')
+           LIMIT 1""",
         (device["id"], alert_type)
     )
     if cursor.fetchone():
