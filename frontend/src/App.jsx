@@ -1,24 +1,29 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import axios from 'axios';
+import mqtt from 'mqtt';
 import { 
   Activity, Shield, Power, Settings, AlertTriangle, 
   FileText, LogOut, CheckCircle, RefreshCw, Wind, 
-  Thermometer, Droplets, Cloud, Lock, Server
+  Thermometer, Droplets, Cloud, Lock, Server, Wifi
 } from 'lucide-react';
 import { 
   LineChart, Line, XAxis, YAxis, CartesianGrid, 
   Tooltip, ResponsiveContainer, Legend 
 } from 'recharts';
 
-const API_BASE = 'http://localhost:8000/api';
+// URL Backend API
+const API_BASE = (import.meta.env.VITE_API_BASE_URL || 'https://iot-air-backend.onrender.com') + '/api';
+
+// Cấu hình WebSocket EMQX Cloud (WSS Port 8084)
+const MQTT_WS_URL = 'wss://lebdf6ce.ala.asia-southeast1.emqxsl.com:8084/mqtt';
 
 export default function App() {
   const [token, setToken] = useState(localStorage.getItem('token') || '');
   const [user, setUser] = useState(JSON.parse(localStorage.getItem('user') || 'null'));
   
   // Login State
-  const [username, setUsername] = useState('admin');
-  const [password, setPassword] = useState('123456');
+  const [username, setUsername] = useState('');
+  const [password, setPassword] = useState('');
   const [loginError, setLoginError] = useState('');
 
   // Dashboard State
@@ -30,13 +35,16 @@ export default function App() {
   const [commands, setCommands] = useState([]);
   const [auditLogs, setAuditLogs] = useState([]);
   const [actionMsg, setActionMsg] = useState('');
+  const [mqttStatus, setMqttStatus] = useState('DISCONNECTED');
 
-  // Remote Config State
+  // Remote Config State (Đã bổ sung TVOC)
   const [sendInterval, setSendInterval] = useState(5000);
-  const [eco2Threshold, setEco2Threshold] = useState(1000);
+  const [eco2Threshold, setEco2Threshold] = useState(1500);
   const [tempThreshold, setTempThreshold] = useState(35);
+  const [tvocThreshold, setTvocThreshold] = useState(600); // Bổ sung ngưỡng TVOC
 
   const authHeader = { headers: { Authorization: `Bearer ${token}` } };
+  const mqttClientRef = useRef(null);
 
   // 1. XỬ LÝ ĐĂNG NHẬP / ĐĂNG XUẤT
   const handleLogin = async (e) => {
@@ -54,13 +62,16 @@ export default function App() {
   };
 
   const handleLogout = () => {
+    if (mqttClientRef.current) {
+      mqttClientRef.current.end();
+    }
     setToken('');
     setUser(null);
     localStorage.clear();
   };
 
-  // 2. TỰ ĐỘNG CẬP NHẬT DỮ LIỆU ĐỊNH KỲ (POLLING MỖI 3S)
-  const fetchData = async () => {
+  // 2. TẢI DỮ LIỆU LỊCH SỬ TỪ AIVEN QUA API (CHẠY 1 LẦN KHI ĐĂNG NHẬP/CHỌN DEVICE)
+  const fetchInitialData = async () => {
     if (!token) return;
     try {
       const [devRes, teleRes, alertRes] = await Promise.all([
@@ -91,13 +102,80 @@ export default function App() {
     }
   };
 
+  // 3. KẾT NỐI REALTIME TRỰC TIẾP VỚI EMQX CLOUD QUA WEBSOCKET
   useEffect(() => {
-    fetchData();
-    const interval = setInterval(fetchData, 3000);
-    return () => clearInterval(interval);
+    if (!token) return;
+
+    fetchInitialData();
+
+    // Tạo Client ID duy nhất để không bị đá session
+    const clientId = `WEB_DASHBOARD_${Math.random().toString(16).substring(2, 8)}`;
+    
+    // Cấu hình tài khoản truy cập MQTT (sử dụng tài khoản EMQX của nhóm)
+    const options = {
+      clientId,
+      username: 'frontend',   // Điền username EMQX 
+      password: '123456', // Điền password EMQX 
+      clean: true,
+      reconnectPeriod: 5000,
+      connectTimeout: 30 * 1000,
+    };
+
+    const client = mqtt.connect(MQTT_WS_URL, options);
+    mqttClientRef.current = client;
+
+    client.on('connect', () => {
+      setMqttStatus('CONNECTED');
+      // Đăng ký nhận dữ liệu cảm biến thời gian thực của thiết bị
+      client.subscribe(`iot_nhom13/${selectedDevice}/telemetry`);
+      client.subscribe(`iot_nhom13/${selectedDevice}/status`);
+    });
+
+    client.on('message', (topic, message) => {
+      try {
+        const payload = JSON.parse(message.toString());
+        const now = new Date().toLocaleTimeString();
+
+        // Xử lý gói tin Telemetry thời gian thực
+        if (topic.includes('telemetry')) {
+          const newTemp = payload.temperature ?? payload.metrics?.temperature?.value ?? 0;
+          const newHum = payload.humidity ?? payload.metrics?.humidity?.value ?? 0;
+          const newEco2 = payload.eco2 ?? payload.metrics?.eco2?.value ?? 400;
+          const newTvoc = payload.tvoc ?? payload.metrics?.tvoc?.value ?? 0;
+
+          setTelemetry(prev => {
+            const nextData = [...prev, {
+              time: now,
+              Temp: Number(newTemp),
+              Hum: Number(newHum),
+              eCO2: Number(newEco2),
+              TVOC: Number(newTvoc)
+            }];
+            // Giữ tối đa 25 điểm trên biểu đồ
+            if (nextData.length > 25) nextData.shift();
+            return nextData;
+          });
+        }
+      } catch (e) {
+        console.error('Lỗi phân tích JSON từ MQTT:', e);
+      }
+    });
+
+    client.on('error', (err) => {
+      console.error('Lỗi kết nối MQTT:', err);
+      setMqttStatus('ERROR');
+    });
+
+    client.on('close', () => {
+      setMqttStatus('DISCONNECTED');
+    });
+
+    return () => {
+      if (client) client.end();
+    };
   }, [token, selectedDevice]);
 
-  // 3. CÁC HÀM TƯƠNG TÁC ĐIỀU KHIỂN & VÒNG ĐỜI
+  // 4. ĐIỀU KHIỂN & CẤU HÌNH THIẾT BỊ
   const handleCommand = async (action) => {
     setActionMsg('Đang gửi lệnh tới ESP32...');
     try {
@@ -105,24 +183,25 @@ export default function App() {
         { target: 'FAN_RELAY', action }, authHeader
       );
       setActionMsg(`Thành công: ${res.data.message}`);
-      fetchData();
     } catch (err) {
       setActionMsg(`Lỗi (${err.response?.status}): ${err.response?.data?.detail}`);
     }
   };
 
+  // Cập nhật cấu hình có bổ sung tvoc_threshold
   const handleUpdateConfig = async (e) => {
     e.preventDefault();
-    setActionMsg('Đang cập nhật cấu hình...');
+    setActionMsg('Đang gửi cấu hình mới xuống ESP32...');
     try {
       const res = await axios.put(`${API_BASE}/devices/${selectedDevice}/config`, {
         send_interval_ms: Number(sendInterval),
         eco2_threshold: Number(eco2Threshold),
-        temp_threshold: Number(tempThreshold)
+        temp_threshold: Number(tempThreshold),
+        tvoc_threshold: Number(tvocThreshold) // Gửi ngưỡng TVOC
       }, authHeader);
-      setActionMsg(`Thành công: ${res.data.message}`);
+      setActionMsg(`Thành công: ${res.data.message || 'Đã áp dụng cấu hình'}`);
     } catch (err) {
-      setActionMsg(`Lỗi: ${err.response?.data?.detail}`);
+      setActionMsg(`Lỗi: ${err.response?.data?.detail || 'Không thể cập nhật'}`);
     }
   };
 
@@ -133,7 +212,7 @@ export default function App() {
         { lifecycle_status: status }, authHeader
       );
       setActionMsg(`Đã chuyển thiết bị sang trạng thái: ${status}`);
-      fetchData();
+      fetchInitialData();
     } catch (err) {
       setActionMsg(`Lỗi: ${err.response?.data?.detail}`);
     }
@@ -144,13 +223,12 @@ export default function App() {
       await axios.put(`${API_BASE}/alerts/${id}/acknowledge`, 
         { resolve_note: 'Đã kiểm tra và xử lý thông gió phòng' }, authHeader
       );
-      fetchData();
+      fetchInitialData();
     } catch (err) {
       alert(err.response?.data?.detail || 'Lỗi xử lý cảnh báo');
     }
   };
 
-  // Lấy dữ liệu mới nhất
   const latest = telemetry[telemetry.length - 1] || { Temp: 0, Hum: 0, eCO2: 400, TVOC: 0 };
   const currentDev = devices.find(d => d.device_code === selectedDevice) || {};
 
@@ -202,14 +280,6 @@ export default function App() {
             </button>
           </form>
 
-          <div className="mt-6 pt-4 border-t border-slate-700 text-xs text-slate-400">
-            <p className="font-semibold text-slate-300 mb-1">Tài khoản demo sẵn (Pass: 123456):</p>
-            <div className="flex justify-between">
-              <button onClick={() => setUsername('admin')} className="text-teal-400 hover:underline">Admin (Toàn quyền)</button>
-              <button onClick={() => setUsername('operator')} className="text-teal-400 hover:underline">Operator (Vận hành)</button>
-              <button onClick={() => setUsername('viewer')} className="text-teal-400 hover:underline">Viewer (Xem)</button>
-            </div>
-          </div>
         </div>
       </div>
     );
@@ -231,6 +301,15 @@ export default function App() {
         </div>
 
         <div className="flex items-center gap-4">
+          {/* Trạng thái kết nối WebSocket MQTT */}
+          <div className="flex items-center gap-1.5 text-xs bg-slate-800 border border-slate-700 px-3 py-1 rounded">
+            <Wifi className={`w-3.5 h-3.5 ${mqttStatus === 'CONNECTED' ? 'text-emerald-400' : 'text-amber-400'}`} />
+            <span>MQTT Cloud: </span>
+            <strong className={mqttStatus === 'CONNECTED' ? 'text-emerald-400' : 'text-amber-400'}>
+              {mqttStatus}
+            </strong>
+          </div>
+
           <div className="text-right">
             <span className="text-sm font-medium text-white">{user?.full_name}</span>
             <div className="flex items-center justify-end gap-1">
@@ -266,7 +345,7 @@ export default function App() {
           onClick={() => setActiveTab('monitoring')} 
           className={`py-3 border-b-2 flex items-center gap-2 ${activeTab === 'monitoring' ? 'border-teal-400 text-teal-400' : 'border-transparent text-slate-400 hover:text-slate-200'}`}
         >
-          <Activity className="w-4 h-4" /> Giám Sát Thời Gian Thực
+          <Activity className="w-4 h-4" /> Giám Sát Thời Gian Thực (MQTT)
         </button>
         <button 
           onClick={() => setActiveTab('control')} 
@@ -337,30 +416,34 @@ export default function App() {
               </div>
 
               <div className={`border p-5 rounded-lg flex items-center justify-between ${
-                latest.eCO2 > 1000 ? 'bg-red-950/20 border-red-800' : 'bg-slate-900 border-slate-800'
+                latest.eCO2 > eco2Threshold ? 'bg-red-950/20 border-red-800' : 'bg-slate-900 border-slate-800'
               }`}>
                 <div>
                   <p className="text-slate-400 text-xs uppercase font-medium">Khí eCO2 (CCS811)</p>
-                  <p className={`text-3xl font-bold mt-1 ${latest.eCO2 > 1000 ? 'text-red-400' : 'text-emerald-400'}`}>
+                  <p className={`text-3xl font-bold mt-1 ${latest.eCO2 > eco2Threshold ? 'text-red-400' : 'text-emerald-400'}`}>
                     {latest.eCO2} <span className="text-sm font-normal text-slate-400">ppm</span>
                   </p>
                 </div>
-                <Cloud className={`w-10 h-10 p-2 rounded-lg ${latest.eCO2 > 1000 ? 'text-red-400 bg-red-950/50' : 'text-emerald-400 bg-emerald-950/40'}`} />
+                <Cloud className={`w-10 h-10 p-2 rounded-lg ${latest.eCO2 > eco2Threshold ? 'text-red-400 bg-red-950/50' : 'text-emerald-400 bg-emerald-950/40'}`} />
               </div>
 
-              <div className="bg-slate-900 border border-slate-800 p-5 rounded-lg flex items-center justify-between">
+              <div className={`border p-5 rounded-lg flex items-center justify-between ${
+                latest.TVOC > tvocThreshold ? 'bg-amber-950/20 border-amber-800' : 'bg-slate-900 border-slate-800'
+              }`}>
                 <div>
                   <p className="text-slate-400 text-xs uppercase font-medium">Khí TVOC (CCS811)</p>
-                  <p className="text-3xl font-bold text-teal-400 mt-1">{latest.TVOC} <span className="text-sm font-normal text-slate-400">ppb</span></p>
+                  <p className={`text-3xl font-bold mt-1 ${latest.TVOC > tvocThreshold ? 'text-amber-400' : 'text-teal-400'}`}>
+                    {latest.TVOC} <span className="text-sm font-normal text-slate-400">ppb</span>
+                  </p>
                 </div>
-                <Wind className="w-10 h-10 text-teal-400 bg-teal-950/40 p-2 rounded-lg" />
+                <Wind className={`w-10 h-10 p-2 rounded-lg ${latest.TVOC > tvocThreshold ? 'text-amber-400 bg-amber-950/40' : 'text-teal-400 bg-teal-950/40'}`} />
               </div>
             </div>
 
             {/* Biểu đồ Thời gian thực (Recharts) */}
             <div className="bg-slate-900 border border-slate-800 p-5 rounded-lg">
               <h2 className="text-base font-semibold text-white mb-4 flex items-center gap-2">
-                <Activity className="w-5 h-5 text-teal-400" /> Biểu Đồ Diễn Biến Chất Lượng Không Khí (Realtime)
+                <Activity className="w-5 h-5 text-teal-400" /> Biểu Đồ Diễn Biến Không Khí (MQTT Live Stream)
               </h2>
               <div className="h-72 w-full">
                 <ResponsiveContainer width="100%" height="100%">
@@ -374,6 +457,7 @@ export default function App() {
                     <Line yAxisId="left" type="monotone" dataKey="Temp" name="Nhiệt độ (°C)" stroke="#fb923c" strokeWidth={2} dot={false} />
                     <Line yAxisId="left" type="monotone" dataKey="Hum" name="Độ ẩm (%)" stroke="#38bdf8" strokeWidth={2} dot={false} />
                     <Line yAxisId="right" type="monotone" dataKey="eCO2" name="eCO2 (ppm)" stroke="#34d399" strokeWidth={2} dot={false} />
+                    <Line yAxisId="left" type="monotone" dataKey="TVOC" name="TVOC (ppb)" stroke="#2dd4bf" strokeWidth={2} dot={false} />
                   </LineChart>
                 </ResponsiveContainer>
               </div>
@@ -384,13 +468,13 @@ export default function App() {
         {/* TAB 2: ĐIỀU KHIỂN & CẤU HÌNH THIẾT BỊ (CONTROL & CONFIG) */}
         {activeTab === 'control' && (
           <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
-            {/* Khối Điều khiển Quạt / Cơ cấu chấp hành */}
+            {/* Khối Điều khiển Quạt */}
             <div className="bg-slate-900 border border-slate-800 p-6 rounded-lg space-y-4">
               <h2 className="text-base font-semibold text-white flex items-center gap-2">
-                <Power className="w-5 h-5 text-teal-400" /> Điều Khiển Quạt Thông Gió / Rơ-le (GPIO 2)
+                <Power className="w-5 h-5 text-teal-400" /> Điều Khiển Quạt Thông Gió / Rơ-le (GPIO 25 / D25)
               </h2>
               <p className="text-sm text-slate-400">
-                Gửi lệnh qua MQTT topic <code className="text-teal-300">command</code> và chờ phản hồi xác nhận <code className="text-teal-300">ack</code> từ ESP32.
+                Gửi lệnh qua MQTT topic <code className="text-teal-300">command</code> và kích hoạt rơ-le trên ESP32.
               </p>
 
               <div className="flex gap-4 pt-4">
@@ -409,32 +493,56 @@ export default function App() {
               </div>
             </div>
 
-            {/* Khối Cấu hình Tham số Từ xa (Remote Config) */}
+            {/* Khối Cấu hình Tham số Từ xa (Remote Config - Đã thêm TVOC) */}
             <div className="bg-slate-900 border border-slate-800 p-6 rounded-lg space-y-4">
               <h2 className="text-base font-semibold text-white flex items-center gap-2">
                 <Settings className="w-5 h-5 text-teal-400" /> Cấu Hình Tham Số Hoạt Động Từ Xa
               </h2>
               <form onSubmit={handleUpdateConfig} className="space-y-3">
-                <div>
-                  <label className="text-xs text-slate-400">Chu kỳ gửi dữ liệu (ms):</label>
-                  <input 
-                    type="number" 
-                    value={sendInterval} 
-                    onChange={e => setSendInterval(e.target.value)}
-                    className="w-full mt-1 p-2 bg-slate-800 border border-slate-700 rounded text-white text-sm" 
-                  />
+                <div className="grid grid-cols-2 gap-3">
+                  <div>
+                    <label className="text-xs text-slate-400">Chu kỳ gửi dữ liệu (ms):</label>
+                    <input 
+                      type="number" 
+                      value={sendInterval} 
+                      onChange={e => setSendInterval(e.target.value)}
+                      className="w-full mt-1 p-2 bg-slate-800 border border-slate-700 rounded text-white text-sm" 
+                    />
+                  </div>
+                  <div>
+                    <label className="text-xs text-slate-400">Ngưỡng Nhiệt độ (°C):</label>
+                    <input 
+                      type="number" 
+                      value={tempThreshold} 
+                      onChange={e => setTempThreshold(e.target.value)}
+                      className="w-full mt-1 p-2 bg-slate-800 border border-slate-700 rounded text-white text-sm" 
+                    />
+                  </div>
                 </div>
-                <div>
-                  <label className="text-xs text-slate-400">Ngưỡng cảnh báo eCO2 (ppm):</label>
-                  <input 
-                    type="number" 
-                    value={eco2Threshold} 
-                    onChange={e => setEco2Threshold(e.target.value)}
-                    className="w-full mt-1 p-2 bg-slate-800 border border-slate-700 rounded text-white text-sm" 
-                  />
+
+                <div className="grid grid-cols-2 gap-3">
+                  <div>
+                    <label className="text-xs text-slate-400">Ngưỡng eCO2 (ppm):</label>
+                    <input 
+                      type="number" 
+                      value={eco2Threshold} 
+                      onChange={e => setEco2Threshold(e.target.value)}
+                      className="w-full mt-1 p-2 bg-slate-800 border border-slate-700 rounded text-white text-sm" 
+                    />
+                  </div>
+                  <div>
+                    <label className="text-xs text-teal-300 font-semibold">Ngưỡng TVOC (ppb):</label>
+                    <input 
+                      type="number" 
+                      value={tvocThreshold} 
+                      onChange={e => setTvocThreshold(e.target.value)}
+                      className="w-full mt-1 p-2 bg-slate-800 border border-teal-500 rounded text-white text-sm focus:outline-none" 
+                    />
+                  </div>
                 </div>
-                <button type="submit" className="w-full py-2 bg-teal-500 hover:bg-teal-600 text-white font-medium rounded text-sm transition">
-                  Cập Nhật Xuống ESP32
+
+                <button type="submit" className="w-full py-2 bg-teal-500 hover:bg-teal-600 text-white font-medium rounded text-sm transition mt-2">
+                  Cập Nhật Ngưỡng Xuống ESP32
                 </button>
               </form>
             </div>
@@ -456,9 +564,6 @@ export default function App() {
                     Thu hồi / Khóa (DECOMMISSIONED)
                   </button>
                 </div>
-                <p className="text-xs text-slate-400">
-                  *Khi chuyển sang <strong className="text-red-400">DECOMMISSIONED</strong>, Backend sẽ từ chối lưu Telemetry và từ chối lệnh điều khiển để phục vụ Demo bước 10.
-                </p>
               </div>
             )}
           </div>
@@ -503,7 +608,7 @@ export default function App() {
                       <td className="p-3 text-right">
                         {a.status === 'NEW' && user?.role !== 'VIEWER' && (
                           <button 
-                            onClick={() => handleAckAlert(a.id)}
+                            onClick={() => handleAckAlert(a.id)} 
                             className="px-3 py-1 bg-teal-600 hover:bg-teal-700 text-white rounded text-xs"
                           >
                             Xác nhận xử lý
@@ -521,7 +626,7 @@ export default function App() {
           </div>
         )}
 
-        {/* TAB 4: QUẢN TRỊ & NHẬT KÝ BẢO MẬT (AUDIT LOGS - CHỈ ADMIN) */}
+        {/* TAB 4: QUẢN TRỊ & AUDIT LOGS */}
         {activeTab === 'audit' && user?.role === 'ADMIN' && (
           <div className="bg-slate-900 border border-slate-800 rounded-lg overflow-hidden">
             <div className="p-4 border-b border-slate-800">
