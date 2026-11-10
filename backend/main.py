@@ -16,7 +16,11 @@ from fastapi import FastAPI, Depends, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel, Field
-from telegram_notifier import send_telegram_alert
+
+if __package__:
+    from .telegram_notifier import send_telegram_alert
+else:
+    from telegram_notifier import send_telegram_alert
 
 # Đọc biến môi trường từ file .env (Mục 4.5)
 load_dotenv()
