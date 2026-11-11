@@ -518,9 +518,12 @@ def send_command(device_code: str, req: CommandRequest, user: dict = Depends(req
         if not device:
             conn.close()
             raise HTTPException(status_code=404, detail="Khong tim thay thiet bi")
-        if device["lifecycle_status"] == "DECOMMISSIONED":
+        if device["lifecycle_status"] in ("MAINTENANCE", "DECOMMISSIONED"):
             conn.close()
-            raise HTTPException(status_code=400, detail="Thiet bi da bi thu hoi (DECOMMISSIONED), khong the dieu khien!")
+            raise HTTPException(
+                status_code=400,
+                detail=f"Thiet bi dang o trang thai {device['lifecycle_status']}, khong the dieu khien!"
+            )
 
         cmd_code = f"CMD_{int(time.time() * 1000)}"
         payload = {

@@ -227,6 +227,11 @@ export default function App() {
 
   // 4. ĐIỀU KHIỂN & CẤU HÌNH THIẾT BỊ
   const handleCommand = async (action) => {
+    if (isDeviceDataHidden) {
+      setActionMsg('Không thể điều khiển quạt khi thiết bị đang bảo trì hoặc đã thu hồi.');
+      return;
+    }
+
     setActionMsg('Đang gửi lệnh tới ESP32...');
     try {
       const res = await axios.post(`${API_BASE}/devices/${selectedDevice}/command`, 
@@ -561,17 +566,24 @@ export default function App() {
               <p className="text-sm text-slate-400">
                 Gửi lệnh qua MQTT topic <code className="text-teal-300">command</code> và kích hoạt rơ-le trên ESP32.
               </p>
+              {isDeviceDataHidden && (
+                <p className="text-sm text-amber-300">
+                  Không thể bật/tắt quạt khi thiết bị đang ở trạng thái {currentDev.lifecycle_status}.
+                </p>
+              )}
 
               <div className="flex gap-4 pt-4">
                 <button 
                   onClick={() => handleCommand('ON')}
-                  className="flex-1 py-3 bg-emerald-600 hover:bg-emerald-700 text-white font-semibold rounded flex items-center justify-center gap-2"
+                  disabled={isDeviceDataHidden}
+                  className="flex-1 py-3 bg-emerald-600 hover:bg-emerald-700 text-white font-semibold rounded flex items-center justify-center gap-2 disabled:cursor-not-allowed disabled:opacity-40 disabled:hover:bg-emerald-600"
                 >
                   <Power className="w-5 h-5" /> BẬT QUẠT
                 </button>
                 <button 
                   onClick={() => handleCommand('OFF')}
-                  className="flex-1 py-3 bg-red-600 hover:bg-red-700 text-white font-semibold rounded flex items-center justify-center gap-2"
+                  disabled={isDeviceDataHidden}
+                  className="flex-1 py-3 bg-red-600 hover:bg-red-700 text-white font-semibold rounded flex items-center justify-center gap-2 disabled:cursor-not-allowed disabled:opacity-40 disabled:hover:bg-red-600"
                 >
                   <Power className="w-5 h-5" /> TẮT QUẠT
                 </button>
