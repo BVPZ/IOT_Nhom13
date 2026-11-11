@@ -57,7 +57,7 @@ float eco2Threshold = 1500.0;             // Ngưỡng cảnh báo eCO2 từ xa 
 int   tvocThreshold = 600;                // Ngưỡng cảnh báo TVOC từ xa (ppb)
 bool  fanState      = false;              // Trạng thái Quạt/Relay (false = OFF, true = ON)
 bool  manualFanOn   = false;              // Lệnh bật quạt từ web được giữ tới khi có lệnh tắt
-bool  alertActive   = false;              // Trạng thái vượt ít nhất một ngưỡng
+bool  fanAlertActive = false;             // Giữ trạng thái quạt tự động tới khi chỉ số giảm còn 2/3 ngưỡng
 bool  ccsAvailable  = false;
 
 // Biến lưu giá trị đọc gần nhất
@@ -67,14 +67,14 @@ int   currentEco2 = 400;
 int   currentTvoc = 0;
 
 void updateFanState() {
-  bool shouldFanRun = manualFanOn || alertActive;
+  bool shouldFanRun = manualFanOn || fanAlertActive;
   if (fanState != shouldFanRun) {
     fanState = shouldFanRun;
     digitalWrite(FAN_RELAY_PIN, fanState ? HIGH : LOW);
     Serial.printf("[FAN] Quat %s (web=%s, vuot_nguong=%s)\n",
                   fanState ? "BAT" : "TAT",
                   manualFanOn ? "ON" : "OFF",
-                  alertActive ? "CO" : "KHONG");
+                  fanAlertActive ? "CO" : "KHONG");
   }
 }
 
@@ -174,8 +174,8 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
       else if (String(action) == "OFF" || String(action) == "TURN_OFF") {
         manualFanOn = false;
         updateFanState();
-        publishAck(cmdCode, "SUCCESS", alertActive
-          ? "Da nhan lenh TAT; quat van bat do dang vuot nguong"
+        publishAck(cmdCode, "SUCCESS", fanAlertActive
+          ? "Da nhan lenh TAT; quat van bat den khi chi so giam con 2/3 nguong"
           : "Da TAT quat thong gio (GPIO 25 LOW)");
       } 
       else {
@@ -304,7 +304,12 @@ void readAndPublishTelemetry() {
   // 3. Logic cảnh báo theo đúng biến cấu hình động nhận từ Cloud
   bool isEco2Alert = (currentEco2 >= eco2Threshold);
   bool isTvocAlert = (currentTvoc >= tvocThreshold);
-  alertActive = isEco2Alert || isTvocAlert;
+  if (isEco2Alert || isTvocAlert) {
+    fanAlertActive = true;
+  } else if (currentEco2 <= eco2Threshold * 2.0 / 3.0 &&
+             currentTvoc <= tvocThreshold * 2.0 / 3.0) {
+    fanAlertActive = false;
+  }
   updateFanState();
 
   digitalWrite(ECO2_LED_PIN, isEco2Alert ? HIGH : LOW);

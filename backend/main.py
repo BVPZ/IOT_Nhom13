@@ -68,42 +68,6 @@ def get_db():
         ssl={" fake_flag_to_enable_tls": True} # Aiven MySQL yêu cầu kết nối SSL
     )
 
-def init_db():
-    if not DB_HOST:
-        print("[ERROR] Chua cau hinh DB_HOST cua Aiven trong file .env!")
-        return
-    print(f"[DB] Dang ket noi toi Aiven MySQL ({DB_HOST}:{DB_PORT})...")
-    conn = get_db()
-    with conn.cursor() as cursor:
-        # Đọc file database/schema.sql và chạy từng câu lệnh CREATE TABLE
-        with open(SCHEMA_PATH, "r", encoding="utf-8") as f:
-            sql_script = f.read()
-        for statement in sql_script.split(";"):
-            stmt = statement.strip()
-            if stmt:
-                cursor.execute(stmt)
-
-        # Kiểm tra xem đã có tài khoản mẫu chưa, nếu chưa thì tạo tự động
-        cursor.execute("SELECT COUNT(*) AS cnt FROM users")
-        if cursor.fetchone()["cnt"] == 0:
-            print("[DB] Dang khoi tao 3 tai khoan mau (admin, operator, viewer) & ESP32_NODE_01...")
-            pw_hash = bcrypt.hashpw("123456".encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
-            cursor.executemany(
-                "INSERT INTO users (username, email, password_hash, full_name, role) VALUES (%s, %s, %s, %s, %s)",
-                [
-                    ("admin", "admin@iot.ptit.edu.vn", pw_hash, "Quản Trị Viên Hệ Thống", "ADMIN"),
-                    ("operator", "operator@iot.ptit.edu.vn", pw_hash, "Nhân Viên Vận Hành Phòng A2", "OPERATOR"),
-                    ("viewer", "viewer@iot.ptit.edu.vn", pw_hash, "Sinh Viên Quan Sát", "VIEWER"),
-                ]
-            )
-            cursor.execute(
-                """INSERT INTO devices (device_code, device_name, secret_token, location, owner_id, lifecycle_status, is_online, send_interval_ms, eco2_threshold, tvoc_threshold, temp_threshold)
-                   VALUES ('ESP32_NODE_01', 'Trạm Giám Sát Không Khí Phòng Học A2', 'sec_tok_esp32_node01_998877aabbcc', 'Phòng Lab Tòa A2', 2, 'ACTIVE', 0, 5000, 1000.0, 500.0, 35.0)"""
-            )
-    conn.commit()
-    conn.close()
-    print("[DB] Ket noi va khoi tao Aiven MySQL THANH CONG! (Mat khau mac dinh: 123456)")
-
 def log_audit(user_id: Optional[int], action: str, target: str, details: str, ip: str = "127.0.0.1"):
     """Ghi Audit Log lên Aiven MySQL (Mục 4.5)"""
     try:
@@ -291,7 +255,11 @@ def on_message(client, userdata, msg):
                 cursor.execute("SELECT * FROM devices WHERE device_code = %s", (device_code,))
                 device = cursor.fetchone()
                 if device and device["lifecycle_status"] != "DECOMMISSIONED":
-                    new_lifecycle = "ACTIVE" if is_online else "OFFLINE"
+                    new_lifecycle = (
+                        "MAINTENANCE"
+                        if device["lifecycle_status"] == "MAINTENANCE"
+                        else "ACTIVE" if is_online else "OFFLINE"
+                    )
                     cursor.execute(
                         "UPDATE devices SET is_online = %s, lifecycle_status = %s, firmware_version = %s, last_seen_at = NOW() WHERE id = %s",
                         (is_online, new_lifecycle, fw_ver, device["id"])
@@ -398,7 +366,7 @@ async def monitor_device_heartbeats():
 
 @app.on_event("startup")
 def startup_event():
-    init_db()
+    # init_db()
     start_mqtt_worker()
     asyncio.create_task(monitor_device_heartbeats())
 
@@ -522,11 +490,17 @@ def change_device_lifecycle(device_code: str, req: LifecycleRequest, user: dict 
 def get_telemetry(device_code: str, limit: int = 30, user: dict = Depends(get_current_user)):
     conn = get_db()
     with conn.cursor() as cursor:
-        cursor.execute("SELECT id FROM devices WHERE device_code = %s", (device_code,))
+        cursor.execute(
+            "SELECT id, lifecycle_status FROM devices WHERE device_code = %s",
+            (device_code,)
+        )
         device = cursor.fetchone()
         if not device:
             conn.close()
             raise HTTPException(status_code=404, detail="Khong tim thay thiet bi")
+        if device["lifecycle_status"] in ("MAINTENANCE", "DECOMMISSIONED"):
+            conn.close()
+            return []
         cursor.execute(
             "SELECT * FROM telemetry_logs WHERE device_id = %s ORDER BY id DESC LIMIT %s",
             (device["id"], limit)

@@ -45,7 +45,14 @@ export default function App() {
 
   const authHeader = { headers: { Authorization: `Bearer ${token}` } };
   const mqttClientRef = useRef(null);
+  const lifecycleStatusRef = useRef({});
   const lastLoadedConfigRef = useRef('');
+
+  useEffect(() => {
+    lifecycleStatusRef.current = Object.fromEntries(
+      devices.map(device => [device.device_code, device.lifecycle_status])
+    );
+  }, [devices]);
 
   useEffect(() => {
     const device = devices.find(item => item.device_code === selectedDevice);
@@ -158,7 +165,10 @@ export default function App() {
         const now = new Date().toLocaleTimeString();
 
         // Xử lý gói tin Telemetry thời gian thực
-        if (topic.includes('telemetry')) {
+        if (
+          topic.includes('telemetry') &&
+          !['MAINTENANCE', 'DECOMMISSIONED'].includes(lifecycleStatusRef.current[selectedDevice])
+        ) {
           const newTemp = payload.temperature ?? payload.metrics?.temperature?.value ?? 0;
           const newHum = payload.humidity ?? payload.metrics?.humidity?.value ?? 0;
           const newEco2 = payload.eco2 ?? payload.metrics?.eco2?.value ?? 400;
@@ -263,6 +273,19 @@ export default function App() {
       await axios.put(`${API_BASE}/devices/${selectedDevice}/lifecycle`, 
         { lifecycle_status: status }, authHeader
       );
+      lifecycleStatusRef.current[selectedDevice] = status;
+      setDevices(prev => prev.map(device => (
+        device.device_code === selectedDevice
+          ? {
+              ...device,
+              lifecycle_status: status,
+              is_online: status === 'ACTIVE' ? device.is_online : 0
+            }
+          : device
+      )));
+      if (['MAINTENANCE', 'DECOMMISSIONED'].includes(status)) {
+        setTelemetry([]);
+      }
       setActionMsg(`Đã chuyển thiết bị sang trạng thái: ${status}`);
       fetchInitialData();
     } catch (err) {
@@ -283,6 +306,7 @@ export default function App() {
 
   const latest = telemetry[telemetry.length - 1] || { Temp: 0, Hum: 0, eCO2: 400, TVOC: 0 };
   const currentDev = devices.find(d => d.device_code === selectedDevice) || {};
+  const isDeviceDataHidden = ['MAINTENANCE', 'DECOMMISSIONED'].includes(currentDev.lifecycle_status);
 
   // =========================================================================
   // GIAO DIỆN 1: MÀN HÌNH ĐĂNG NHẬP
@@ -448,6 +472,14 @@ export default function App() {
 
         {/* TAB 1: GIÁM SÁT THỜI GIAN THỰC (MONITORING) */}
         {activeTab === 'monitoring' && (
+          isDeviceDataHidden ? (
+            <div className="rounded-lg border border-amber-700 bg-amber-950/30 p-6 text-center">
+              <h2 className="text-lg font-semibold text-amber-300">Dữ liệu thiết bị đang được ẩn</h2>
+              <p className="mt-2 text-sm text-slate-300">
+                Thiết bị đang ở trạng thái {currentDev.lifecycle_status}. Chuyển thiết bị về ACTIVE để xem dữ liệu.
+              </p>
+            </div>
+          ) : (
           <div className="space-y-6">
             {/* 4 Cards Số đo */}
             <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
@@ -515,6 +547,7 @@ export default function App() {
               </div>
             </div>
           </div>
+          )
         )}
 
         {/* TAB 2: ĐIỀU KHIỂN & CẤU HÌNH THIẾT BỊ (CONTROL & CONFIG) */}
