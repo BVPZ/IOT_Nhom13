@@ -1,374 +1,233 @@
-import React, { useState, useEffect, useRef } from 'react';
-import axios from 'axios';
-import mqtt from 'mqtt';
-import { 
-  Activity, Shield, Power, Settings, AlertTriangle, 
-  FileText, LogOut, CheckCircle, RefreshCw, Wind, 
-  Thermometer, Droplets, Cloud, Lock, Server, Wifi
+import { useCallback, useEffect, useMemo, useState } from 'react';
+import {
+  Activity, Shield, Power, Settings, AlertTriangle,
+  LogOut, Wind, Thermometer, Droplets, Cloud, Lock, Server, Wifi
 } from 'lucide-react';
-import { 
-  LineChart, Line, XAxis, YAxis, CartesianGrid, 
-  Tooltip, ResponsiveContainer, Legend 
+import {
+  LineChart, Line, XAxis, YAxis, CartesianGrid,
+  Tooltip, ResponsiveContainer, Legend
 } from 'recharts';
+import AdminAccess from './AdminAccess';
+import AuthScreen from './AuthScreen';
+import DeviceCatalog from './DeviceCatalog';
+import { apiError, createApi } from './api';
 
-// URL Backend API
-const API_BASE = (import.meta.env.VITE_API_BASE_URL || 'https://iot-air-backend.onrender.com') + '/api';
+const POLL_INTERVAL = 5000;
+const VIEW_ONLY = 'Tài khoản chỉ có quyền Giám sát (VIEW)';
+const DETAIL_TABS = ['monitoring', 'control', 'alerts'];
 
-// Cấu hình WebSocket EMQX Cloud (WSS Port 8084)
-const MQTT_WS_URL = 'wss://lebdf6ce.ala.asia-southeast1.emqxsl.com:8084/mqtt';
+function poll(load) {
+  const controller = new AbortController();
+  let timeout;
+  async function refresh() {
+    await load(controller.signal);
+    if (!controller.signal.aborted) timeout = window.setTimeout(refresh, POLL_INTERVAL);
+  }
+  refresh();
+  return () => {
+    controller.abort();
+    window.clearTimeout(timeout);
+  };
+}
+
+function NavigationTab({ active, onClick, children }) {
+  const color = active ? 'border-teal-400 text-teal-400' : 'border-transparent text-slate-400 hover:text-slate-200';
+  return <button aria-current={active ? 'page' : undefined} onClick={onClick}
+    className={`flex shrink-0 items-center gap-2 border-b-2 py-3 ${color}`}>{children}</button>;
+}
 
 export default function App() {
-  const [token, setToken] = useState(localStorage.getItem('token') || '');
-  const [user, setUser] = useState(JSON.parse(localStorage.getItem('user') || 'null'));
-  
-  // Login State
-  const [username, setUsername] = useState('');
-  const [password, setPassword] = useState('');
-  const [loginError, setLoginError] = useState('');
+  const [token, setToken] = useState(() => localStorage.getItem('token') || '');
 
-  // Dashboard State
-  const [activeTab, setActiveTab] = useState('monitoring');
-  const [devices, setDevices] = useState([]);
-  const [selectedDevice, setSelectedDevice] = useState('ESP32_NODE_01');
-  const [telemetry, setTelemetry] = useState([]);
-  const [alerts, setAlerts] = useState([]);
-  const [commands, setCommands] = useState([]);
-  const [auditLogs, setAuditLogs] = useState([]);
-  const [actionMsg, setActionMsg] = useState('');
-  const [mqttStatus, setMqttStatus] = useState('DISCONNECTED');
-
-  // Remote Config State (Đã bổ sung TVOC)
-  const [sendInterval, setSendInterval] = useState(5000);
-  const [eco2Threshold, setEco2Threshold] = useState(1500);
-  const [tempThreshold, setTempThreshold] = useState(35);
-  const [tvocThreshold, setTvocThreshold] = useState(600); // Bổ sung ngưỡng TVOC
-
-  const authHeader = { headers: { Authorization: `Bearer ${token}` } };
-  const mqttClientRef = useRef(null);
-  const lifecycleStatusRef = useRef({});
-  const lastLoadedConfigRef = useRef('');
-
-  useEffect(() => {
-    lifecycleStatusRef.current = Object.fromEntries(
-      devices.map(device => [device.device_code, device.lifecycle_status])
-    );
-  }, [devices]);
-
-  useEffect(() => {
-    const device = devices.find(item => item.device_code === selectedDevice);
-    if (!device) return;
-
-    const configVersion = [
-      selectedDevice,
-      device.send_interval_ms,
-      device.eco2_threshold,
-      device.temp_threshold,
-      device.tvoc_threshold
-    ].join(':');
-    if (lastLoadedConfigRef.current === configVersion) return;
-    lastLoadedConfigRef.current = configVersion;
-
-    setSendInterval(device.send_interval_ms ?? 5000);
-    setEco2Threshold(device.eco2_threshold ?? 1500);
-    setTempThreshold(device.temp_threshold ?? 35);
-    setTvocThreshold(device.tvoc_threshold ?? 600);
-  }, [devices, selectedDevice]);
-
-  // 1. XỬ LÝ ĐĂNG NHẬP / ĐĂNG XUẤT
-  const handleLogin = async (e) => {
-    e.preventDefault();
-    setLoginError('');
-    try {
-      const res = await axios.post(`${API_BASE}/auth/login`, { username, password });
-      setToken(res.data.access_token);
-      setUser(res.data.user);
-      localStorage.setItem('token', res.data.access_token);
-      localStorage.setItem('user', JSON.stringify(res.data.user));
-    } catch (err) {
-      setLoginError(err.response?.data?.detail || 'Đăng nhập thất bại!');
-    }
-  };
-
-  const handleLogout = () => {
-    if (mqttClientRef.current) {
-      mqttClientRef.current.end();
-    }
-    setToken('');
-    setUser(null);
-    localStorage.clear();
-  };
-
-  // 2. TẢI DỮ LIỆU LỊCH SỬ TỪ AIVEN QUA API (CHẠY 1 LẦN KHI ĐĂNG NHẬP/CHỌN DEVICE)
-  const fetchInitialData = async () => {
-    if (!token) return;
-    try {
-      const [devRes, teleRes, alertRes] = await Promise.all([
-        axios.get(`${API_BASE}/devices`, authHeader),
-        axios.get(`${API_BASE}/devices/${selectedDevice}/telemetry?limit=25`, authHeader),
-        axios.get(`${API_BASE}/alerts`, authHeader)
-      ]);
-      setDevices(devRes.data);
-      setTelemetry(teleRes.data.map(d => ({
-        time: d.recorded_at ? d.recorded_at.split(' ')[1] || d.recorded_at : '',
-        Temp: d.temperature,
-        Hum: d.humidity,
-        eCO2: d.eco2,
-        TVOC: d.tvoc
-      })));
-      setAlerts(alertRes.data);
-
-      if (user?.role === 'ADMIN') {
-        const [cmdRes, auditRes] = await Promise.all([
-          axios.get(`${API_BASE}/commands`, authHeader),
-          axios.get(`${API_BASE}/audit-logs`, authHeader)
-        ]);
-        setCommands(cmdRes.data);
-        setAuditLogs(auditRes.data);
-      }
-    } catch (err) {
-      if (err.response?.status === 401) handleLogout();
-    }
-  };
-
-  // 3. KẾT NỐI REALTIME TRỰC TIẾP VỚI EMQX CLOUD QUA WEBSOCKET
-  useEffect(() => {
-    if (!token) return;
-
-    fetchInitialData();
-
-    // Tạo Client ID duy nhất để không bị đá session
-    const clientId = `WEB_DASHBOARD_${Math.random().toString(16).substring(2, 8)}`;
-    
-    // Cấu hình tài khoản truy cập MQTT (sử dụng tài khoản EMQX của nhóm)
-    const options = {
-      clientId,
-      username: 'frontend',   // Điền username EMQX 
-      password: '123456', // Điền password EMQX 
-      clean: true,
-      reconnectPeriod: 5000,
-      connectTimeout: 30 * 1000,
-    };
-
-    const client = mqtt.connect(MQTT_WS_URL, options);
-    mqttClientRef.current = client;
-
-    client.on('connect', () => {
-      setMqttStatus('CONNECTED');
-      // Đăng ký nhận dữ liệu cảm biến thời gian thực của thiết bị
-      client.subscribe(`iot_nhom13/${selectedDevice}/telemetry`);
-      client.subscribe(`iot_nhom13/${selectedDevice}/status`);
-    });
-
-    client.on('message', (topic, message) => {
-      try {
-        const payload = JSON.parse(message.toString());
-        const now = new Date().toLocaleTimeString();
-
-        // Xử lý gói tin Telemetry thời gian thực
-        if (
-          topic.includes('telemetry') &&
-          !['MAINTENANCE', 'DECOMMISSIONED'].includes(lifecycleStatusRef.current[selectedDevice])
-        ) {
-          const newTemp = payload.temperature ?? payload.metrics?.temperature?.value ?? 0;
-          const newHum = payload.humidity ?? payload.metrics?.humidity?.value ?? 0;
-          const newEco2 = payload.eco2 ?? payload.metrics?.eco2?.value ?? 400;
-          const newTvoc = payload.tvoc ?? payload.metrics?.tvoc?.value ?? 0;
-
-          setTelemetry(prev => {
-            const nextData = [...prev, {
-              time: now,
-              Temp: Number(newTemp),
-              Hum: Number(newHum),
-              eCO2: Number(newEco2),
-              TVOC: Number(newTvoc)
-            }];
-            // Giữ tối đa 25 điểm trên biểu đồ
-            if (nextData.length > 25) nextData.shift();
-            return nextData;
-          });
-        }
-      } catch (e) {
-        console.error('Lỗi phân tích JSON từ MQTT:', e);
-      }
-    });
-
-    client.on('error', (err) => {
-      console.error('Lỗi kết nối MQTT:', err);
-      setMqttStatus('ERROR');
-    });
-
-    client.on('close', () => {
-      setMqttStatus('DISCONNECTED');
-    });
-
-    return () => {
-      if (client) client.end();
-    };
-  }, [token, selectedDevice]);
-
-  useEffect(() => {
-    if (!token) return undefined;
-
-    const refreshDeviceStatus = async () => {
-      try {
-        const response = await axios.get(`${API_BASE}/devices`, {
-          headers: { Authorization: `Bearer ${token}` }
-        });
-        setDevices(response.data);
-      } catch (err) {
-        if (err.response?.status === 401) handleLogout();
-        else console.error('Không thể cập nhật trạng thái thiết bị:', err);
-      }
-    };
-
-    const intervalId = window.setInterval(refreshDeviceStatus, 5000);
-    return () => window.clearInterval(intervalId);
-  }, [token]);
-
-  // 4. ĐIỀU KHIỂN & CẤU HÌNH THIẾT BỊ
-  const handleCommand = async (action) => {
-    if (isDeviceDataHidden) {
-      setActionMsg('Không thể điều khiển quạt khi thiết bị đang bảo trì hoặc đã thu hồi.');
-      return;
-    }
-
-    setActionMsg('Đang gửi lệnh tới ESP32...');
-    try {
-      const res = await axios.post(`${API_BASE}/devices/${selectedDevice}/command`, 
-        { target: 'FAN_RELAY', action }, authHeader
-      );
-      setActionMsg(`Thành công: ${res.data.message}`);
-    } catch (err) {
-      setActionMsg(`Lỗi (${err.response?.status}): ${err.response?.data?.detail}`);
-    }
-  };
-
-  // Cập nhật cấu hình có bổ sung tvoc_threshold
-  const handleUpdateConfig = async (e) => {
-    e.preventDefault();
-    setActionMsg('Đang gửi cấu hình mới xuống ESP32...');
-    try {
-      const res = await axios.put(`${API_BASE}/devices/${selectedDevice}/config`, {
-        send_interval_ms: Number(sendInterval),
-        eco2_threshold: Number(eco2Threshold),
-        temp_threshold: Number(tempThreshold),
-        tvoc_threshold: Number(tvocThreshold) // Gửi ngưỡng TVOC
-      }, authHeader);
-      const savedConfig = res.data.config;
-      if (savedConfig) {
-        setSendInterval(savedConfig.send_interval_ms);
-        setEco2Threshold(savedConfig.eco2_threshold);
-        setTempThreshold(savedConfig.temp_threshold);
-        setTvocThreshold(savedConfig.tvoc_threshold);
-        setDevices(prev => prev.map(device => (
-          device.device_code === selectedDevice
-            ? { ...device, ...savedConfig }
-            : device
-        )));
-      }
-      setActionMsg(`Thành công: ${res.data.message || 'Đã áp dụng cấu hình'}`);
-    } catch (err) {
-      setActionMsg(`Lỗi: ${err.response?.data?.detail || 'Không thể cập nhật'}`);
-    }
-  };
-
-  const handleLifecycle = async (status) => {
-    if (!window.confirm(`Xác nhận đổi trạng thái thiết bị sang ${status}?`)) return;
-    try {
-      await axios.put(`${API_BASE}/devices/${selectedDevice}/lifecycle`, 
-        { lifecycle_status: status }, authHeader
-      );
-      lifecycleStatusRef.current[selectedDevice] = status;
-      setDevices(prev => prev.map(device => (
-        device.device_code === selectedDevice
-          ? {
-              ...device,
-              lifecycle_status: status,
-              is_online: status === 'ACTIVE' ? device.is_online : 0
-            }
-          : device
-      )));
-      if (['MAINTENANCE', 'DECOMMISSIONED'].includes(status)) {
-        setTelemetry([]);
-      }
-      setActionMsg(`Đã chuyển thiết bị sang trạng thái: ${status}`);
-      fetchInitialData();
-    } catch (err) {
-      setActionMsg(`Lỗi: ${err.response?.data?.detail}`);
-    }
-  };
-
-  const handleAckAlert = async (id) => {
-    try {
-      await axios.put(`${API_BASE}/alerts/${id}/acknowledge`, 
-        { resolve_note: 'Đã kiểm tra và xử lý thông gió phòng' }, authHeader
-      );
-      fetchInitialData();
-    } catch (err) {
-      alert(err.response?.data?.detail || 'Lỗi xử lý cảnh báo');
-    }
-  };
-
-  const latest = telemetry[telemetry.length - 1] || { Temp: 0, Hum: 0, eCO2: 400, TVOC: 0 };
-  const currentDev = devices.find(d => d.device_code === selectedDevice) || {};
-  const isDeviceDataHidden = ['MAINTENANCE', 'DECOMMISSIONED'].includes(currentDev.lifecycle_status);
-
-  // =========================================================================
-  // GIAO DIỆN 1: MÀN HÌNH ĐĂNG NHẬP
-  // =========================================================================
-  if (!token) {
-    return (
-      <div className="min-h-screen bg-slate-900 flex items-center justify-center p-4">
-        <div className="bg-slate-800 border border-slate-700 rounded-xl p-8 max-w-md w-full shadow-2xl">
-          <div className="text-center mb-8">
-            <Activity className="w-12 h-12 text-teal-400 mx-auto mb-2" />
-            <h1 className="text-2xl font-bold text-white">Hệ Thống Giám Sát Không Khí</h1>
-            <p className="text-slate-400 text-sm mt-1">Đồ Án IoT & Ứng Dụng - Nhóm 13</p>
-          </div>
-
-          {loginError && (
-            <div className="mb-4 p-3 bg-red-900/50 border border-red-500 rounded text-red-200 text-sm">
-              {loginError}
-            </div>
-          )}
-
-          <form onSubmit={handleLogin} className="space-y-4">
-            <div>
-              <label className="text-slate-300 text-sm font-medium">Tên đăng nhập</label>
-              <input 
-                type="text" 
-                value={username} 
-                onChange={(e) => setUsername(e.target.value)}
-                className="w-full mt-1 p-3 bg-slate-900 border border-slate-700 rounded text-white focus:outline-none focus:border-teal-500" 
-                required 
-              />
-            </div>
-            <div>
-              <label className="text-slate-300 text-sm font-medium">Mật khẩu</label>
-              <input 
-                type="password" 
-                value={password} 
-                onChange={(e) => setPassword(e.target.value)}
-                className="w-full mt-1 p-3 bg-slate-900 border border-slate-700 rounded text-white focus:outline-none focus:border-teal-500" 
-                required 
-              />
-            </div>
-            <button 
-              type="submit" 
-              className="w-full py-3 bg-teal-500 hover:bg-teal-600 text-white font-semibold rounded transition"
-            >
-              Đăng Nhập
-            </button>
-          </form>
-
-        </div>
-      </div>
-    );
+  function login(accessToken) {
+    localStorage.setItem('token', accessToken);
+    setToken(accessToken);
   }
 
-  // =========================================================================
-  // GIAO DIỆN 2: DASHBOARD CHÍNH
-  // =========================================================================
+  const logout = useCallback(() => {
+    localStorage.removeItem('token');
+    localStorage.removeItem('user');
+    setToken('');
+  }, []);
+
+  return token
+    ? <Dashboard key={token} token={token} onLogout={logout} />
+    : <AuthScreen onLogin={login} />;
+}
+
+function Dashboard({ token, onLogout }) {
+  const api = useMemo(() => createApi(token), [token]);
+  const [account, setAccount] = useState(null);
+  const [catalog, setCatalog] = useState([]);
+  const [devices, setDevices] = useState([]);
+  const [apiStatus, setApiStatus] = useState('loading');
+  const [activeTab, setActiveTab] = useState('catalog');
+  const [selectedDevice, setSelectedDevice] = useState('');
+  const [details, setDetails] = useState(null);
+  const [auditLogs, setAuditLogs] = useState([]);
+  const [actionMsg, setActionMsg] = useState('');
+  const [revision, setRevision] = useState(0);
+  const [configEdits, setConfigEdits] = useState({});
+  const refreshDevices = useCallback(() => setRevision(value => value + 1), []);
+  const isAdmin = account?.role === 'ADMIN';
+  const currentDev = devices.find(device => device.device_code === selectedDevice);
+  const tab = (DETAIL_TABS.includes(activeTab) && !currentDev)
+    || (['admin', 'audit'].includes(activeTab) && !isAdmin) ? 'catalog' : activeTab;
+  const canControl = currentDev?.permission === 'CONTROL';
+  const isDeviceDataHidden = ['MAINTENANCE', 'DECOMMISSIONED'].includes(currentDev?.lifecycle_status);
+  const selectedDetails = currentDev && details?.deviceCode === selectedDevice ? details : null;
+  const telemetry = selectedDetails?.telemetry || [];
+  const alerts = selectedDetails?.alerts || [];
+  const latest = telemetry.at(-1) || { Temp: '—', Hum: '—', eCO2: '—', TVOC: '—' };
+  const config = {
+    send_interval_ms: currentDev?.send_interval_ms ?? 5000,
+    eco2_threshold: currentDev?.eco2_threshold ?? 1500,
+    temp_threshold: currentDev?.temp_threshold ?? 35,
+    tvoc_threshold: currentDev?.tvoc_threshold ?? 600,
+    ...configEdits,
+  };
+  const { send_interval_ms: sendInterval, eco2_threshold: eco2Threshold,
+    temp_threshold: tempThreshold, tvoc_threshold: tvocThreshold } = config;
+
+  useEffect(() => poll(async signal => {
+    try {
+      const [userResponse, catalogResponse, devicesResponse] = await Promise.all([
+        api.get('/auth/me', { signal }),
+        api.get('/devices/catalog', { signal }),
+        api.get('/devices', { signal }),
+      ]);
+      if (signal.aborted) return;
+      setAccount(userResponse.data);
+      setCatalog(catalogResponse.data);
+      setDevices(devicesResponse.data);
+      setSelectedDevice(code => devicesResponse.data.some(device => device.device_code === code) ? code : '');
+      setApiStatus('ready');
+    } catch (error) {
+      if (signal.aborted) return;
+      if (error.response?.status === 401) onLogout();
+      else setApiStatus('error');
+    }
+  }), [api, onLogout, revision]);
+
+  const detailCode = currentDev && DETAIL_TABS.includes(tab) ? currentDev.device_code : '';
+  useEffect(() => {
+    if (!detailCode) return;
+    const path = `/devices/${encodeURIComponent(detailCode)}`;
+    return poll(async signal => {
+      try {
+        const [samples, deviceAlerts] = await Promise.all([
+          api.get(`${path}/telemetry`, { signal, params: { limit: 25 } }),
+          api.get(`${path}/alerts`, { signal }),
+        ]);
+        if (signal.aborted) return;
+        setDetails({
+          deviceCode: detailCode,
+          telemetry: samples.data.map(sample => ({
+            time: sample.recorded_at?.split(/[T ]/)[1]?.slice(0, 8) || '',
+            Temp: sample.temperature, Hum: sample.humidity, eCO2: sample.eco2, TVOC: sample.tvoc,
+          })),
+          alerts: deviceAlerts.data,
+        });
+      } catch (error) {
+        if (signal.aborted) return;
+        if (error.response?.status === 401) onLogout();
+        else if ([403, 404].includes(error.response?.status)) {
+          setDetails(null);
+          setSelectedDevice(code => code === detailCode ? '' : code);
+          setActionMsg('Node này không còn khả dụng hoặc quyền truy cập đã thay đổi.');
+        } else {
+          setDetails({ deviceCode: detailCode, error: apiError(error, 'Không thể tải số liệu và cảnh báo của node.') });
+        }
+      }
+    });
+  }, [api, detailCode, onLogout, revision]);
+
+  useEffect(() => {
+    if (tab !== 'audit') return;
+    return poll(async signal => {
+      try {
+        const response = await api.get('/audit-logs', { signal });
+        if (!signal.aborted) setAuditLogs(response.data);
+      } catch (error) {
+        if (signal.aborted) return;
+        if (error.response?.status === 401) onLogout();
+        else setActionMsg(apiError(error, 'Không thể tải nhật ký bảo mật.'));
+      }
+    });
+  }, [api, onLogout, tab]);
+
+  function openDevice(code, nextTab = 'monitoring') {
+    if (code !== selectedDevice) {
+      setDetails(null);
+      setConfigEdits({});
+      setActionMsg('');
+    }
+    setSelectedDevice(code);
+    setActiveTab(nextTab);
+  }
+
+  function updateConfigField(field, value) {
+    setConfigEdits(edits => ({ ...edits, [field]: value }));
+  }
+
+  async function perform(operation, fallback) {
+    try {
+      await operation();
+    } catch (error) {
+      if (error.response?.status === 401) onLogout();
+      else {
+        setActionMsg(apiError(error, fallback));
+        if (error.response?.status === 403) refreshDevices();
+      }
+    }
+  }
+
+  const devicePath = `/devices/${encodeURIComponent(selectedDevice)}`;
+
+  function handleCommand(action) {
+    if (!canControl || isDeviceDataHidden) return;
+    return perform(async () => {
+      const response = await api.post(`${devicePath}/command`, { target: 'FAN_RELAY', action });
+      setActionMsg(response.data.message);
+    }, 'Không thể gửi lệnh điều khiển.');
+  }
+
+  function handleUpdateConfig(event) {
+    event.preventDefault();
+    if (!canControl || isDeviceDataHidden) return;
+    const submittedEdits = configEdits;
+    return perform(async () => {
+      const response = await api.put(`${devicePath}/config`, {
+        send_interval_ms: Number(sendInterval), eco2_threshold: Number(eco2Threshold),
+        temp_threshold: Number(tempThreshold), tvoc_threshold: Number(tvocThreshold),
+      });
+      setDevices(items => items.map(item => item.device_code === selectedDevice ? { ...item, ...response.data.config } : item));
+      setConfigEdits(edits => edits === submittedEdits ? {} : edits);
+      setActionMsg(response.data.message);
+      refreshDevices();
+    }, 'Không thể cập nhật cấu hình. Hãy kiểm tra các giá trị đã nhập.');
+  }
+
+  function handleLifecycle(status) {
+    if (!window.confirm(`Xác nhận đổi trạng thái thiết bị sang ${status}?`)) return;
+    return perform(async () => {
+      await api.put(`${devicePath}/lifecycle`, { lifecycle_status: status });
+      setDevices(items => items.map(item => item.device_code === selectedDevice
+        ? { ...item, lifecycle_status: status, is_online: status === 'ACTIVE' ? item.is_online : 0 }
+        : item));
+      setDetails(null);
+      setActionMsg(`Đã chuyển thiết bị sang trạng thái ${status}.`);
+      refreshDevices();
+    }, 'Không thể đổi trạng thái thiết bị.');
+  }
+
+  function handleAckAlert(id) {
+    if (!canControl) return;
+    return perform(async () => {
+      await api.put(`/alerts/${id}/acknowledge`, { resolve_note: 'Đã kiểm tra và xử lý thông gió phòng' });
+      refreshDevices();
+    }, 'Không thể xác nhận cảnh báo.');
+  }
   return (
     <div className="min-h-screen bg-slate-950 text-slate-100 flex flex-col">
       {/* Top Header */}
@@ -382,28 +241,25 @@ export default function App() {
         </div>
 
         <div className="flex items-center gap-4">
-          {/* Trạng thái kết nối WebSocket MQTT */}
           <div className="flex items-center gap-1.5 text-xs bg-slate-800 border border-slate-700 px-3 py-1 rounded">
-            <Wifi className={`w-3.5 h-3.5 ${mqttStatus === 'CONNECTED' ? 'text-emerald-400' : 'text-amber-400'}`} />
-            <span title="Kết nối MQTT của trình duyệt dashboard, không phải trạng thái online của ESP32">MQTT Web: </span>
-            <strong className={mqttStatus === 'CONNECTED' ? 'text-emerald-400' : 'text-amber-400'}>
-              {mqttStatus}
+            <Wifi className={`w-3.5 h-3.5 ${apiStatus === 'ready' ? 'text-emerald-400' : 'text-amber-400'}`} />
+            <strong role="status" className={apiStatus === 'ready' ? 'text-emerald-400' : 'text-amber-400'}>
+              {{ ready: 'Đã kết nối API', loading: 'Đang kết nối API', error: 'Không thể kết nối API' }[apiStatus]}
             </strong>
           </div>
 
           <div className="text-right">
-            <span className="text-sm font-medium text-white">{user?.full_name}</span>
+            <span className="text-sm font-medium text-white">{account?.full_name}</span>
             <div className="flex items-center justify-end gap-1">
               <span className={`text-xs px-2 py-0.5 rounded font-bold ${
-                user?.role === 'ADMIN' ? 'bg-purple-900 text-purple-300' : 
-                user?.role === 'OPERATOR' ? 'bg-blue-900 text-blue-300' : 'bg-slate-800 text-slate-300'
+                isAdmin ? 'bg-purple-900 text-purple-300' : 'bg-slate-800 text-slate-300'
               }`}>
-                {user?.role}
+                {account?.role}
               </span>
             </div>
           </div>
           <button 
-            onClick={handleLogout} 
+            onClick={onLogout}
             className="p-2 hover:bg-slate-800 rounded text-slate-400 hover:text-white"
             title="Đăng xuất"
           >
@@ -421,39 +277,44 @@ export default function App() {
       )}
 
       {/* Main Navigation Tabs */}
-      <div className="bg-slate-900/50 border-b border-slate-800 px-6 flex gap-6 text-sm font-medium">
-        <button 
-          onClick={() => setActiveTab('monitoring')} 
-          className={`py-3 border-b-2 flex items-center gap-2 ${activeTab === 'monitoring' ? 'border-teal-400 text-teal-400' : 'border-transparent text-slate-400 hover:text-slate-200'}`}
-        >
-          <Activity className="w-4 h-4" /> Giám Sát Thời Gian Thực (MQTT)
-        </button>
-        <button 
-          onClick={() => setActiveTab('control')} 
-          className={`py-3 border-b-2 flex items-center gap-2 ${activeTab === 'control' ? 'border-teal-400 text-teal-400' : 'border-transparent text-slate-400 hover:text-slate-200'}`}
-        >
-          <Power className="w-4 h-4" /> Điều Khiển & Cấu Hình
-        </button>
-        <button 
-          onClick={() => setActiveTab('alerts')} 
-          className={`py-3 border-b-2 flex items-center gap-2 ${activeTab === 'alerts' ? 'border-teal-400 text-teal-400' : 'border-transparent text-slate-400 hover:text-slate-200'}`}
-        >
-          <AlertTriangle className="w-4 h-4" /> Cảnh Báo ({alerts.filter(a => a.status === 'NEW').length})
-        </button>
-        {user?.role === 'ADMIN' && (
-          <button 
-            onClick={() => setActiveTab('audit')} 
-            className={`py-3 border-b-2 flex items-center gap-2 ${activeTab === 'audit' ? 'border-teal-400 text-teal-400' : 'border-transparent text-slate-400 hover:text-slate-200'}`}
-          >
-            <Shield className="w-4 h-4" /> Quản Trị & Audit Logs
-          </button>
+      <nav className="flex flex-wrap gap-x-6 border-b border-slate-800 bg-slate-900/50 px-6 text-sm font-medium">
+        <NavigationTab active={tab === 'catalog'} onClick={() => setActiveTab('catalog')}>
+          <Server className="w-4 h-4" /> Danh mục node
+        </NavigationTab>
+        {currentDev && (
+          <>
+            <NavigationTab active={tab === 'monitoring'} onClick={() => setActiveTab('monitoring')}>
+              <Activity className="w-4 h-4" /> Giám sát
+            </NavigationTab>
+            <NavigationTab active={tab === 'control'} onClick={() => setActiveTab('control')}>
+              <Power className="w-4 h-4" /> Điều khiển và cấu hình
+            </NavigationTab>
+            <NavigationTab active={tab === 'alerts'} onClick={() => setActiveTab('alerts')}>
+              <AlertTriangle className="w-4 h-4" /> Cảnh báo ({alerts.filter(alert => alert.status === 'NEW').length})
+            </NavigationTab>
+          </>
         )}
-      </div>
+        {isAdmin && (
+          <>
+            <NavigationTab active={tab === 'admin'} onClick={() => setActiveTab('admin')}>
+              <Lock className="w-4 h-4" /> Quản lý phân quyền
+            </NavigationTab>
+            <NavigationTab active={tab === 'audit'} onClick={() => setActiveTab('audit')}>
+              <Shield className="w-4 h-4" /> Nhật ký bảo mật
+            </NavigationTab>
+          </>
+        )}
+      </nav>
 
       {/* Tab Content Area */}
       <main className="p-6 flex-1 overflow-auto space-y-6">
-        
+        {tab === 'catalog' && <DeviceCatalog devices={catalog} loaded={Boolean(account)} api={api} onOpen={openDevice}
+          onRequested={() => { setActionMsg('Đã gửi yêu cầu truy cập.'); refreshDevices(); }} />}
+        {tab === 'admin' && <AdminAccess api={api} catalog={catalog} devices={devices} refreshDevices={refreshDevices} openDevice={openDevice} />}
+        {detailCode && selectedDetails?.error && <p role="alert" className="text-sm text-amber-300">{selectedDetails.error}</p>}
+
         {/* Device Status Bar */}
+        {detailCode && (
         <div className="bg-slate-900 border border-slate-800 rounded-lg p-4 flex flex-wrap justify-between items-center gap-4">
           <div className="flex items-center gap-3">
             <Server className="w-5 h-5 text-teal-400" />
@@ -472,11 +333,13 @@ export default function App() {
             <span className="text-xs bg-slate-800 border border-slate-700 px-2 py-1 rounded">
               Vòng đời: <strong className="text-teal-300">{currentDev.lifecycle_status}</strong>
             </span>
+            <span className="text-sm text-teal-300">{canControl ? 'Xem và điều khiển' : 'Chỉ xem'}</span>
           </div>
         </div>
+        )}
 
         {/* TAB 1: GIÁM SÁT THỜI GIAN THỰC (MONITORING) */}
-        {activeTab === 'monitoring' && (
+        {tab === 'monitoring' && (
           isDeviceDataHidden ? (
             <div className="rounded-lg border border-amber-700 bg-amber-950/30 p-6 text-center">
               <h2 className="text-lg font-semibold text-amber-300">Dữ liệu thiết bị đang được ẩn</h2>
@@ -532,7 +395,7 @@ export default function App() {
             {/* Biểu đồ Thời gian thực (Recharts) */}
             <div className="bg-slate-900 border border-slate-800 p-5 rounded-lg">
               <h2 className="text-base font-semibold text-white mb-4 flex items-center gap-2">
-                <Activity className="w-5 h-5 text-teal-400" /> Biểu Đồ Diễn Biến Không Khí (MQTT Live Stream)
+                <Activity className="w-5 h-5 text-teal-400" /> Biểu đồ diễn biến chất lượng không khí
               </h2>
               <div className="h-72 w-full">
                 <ResponsiveContainer width="100%" height="100%">
@@ -556,7 +419,7 @@ export default function App() {
         )}
 
         {/* TAB 2: ĐIỀU KHIỂN & CẤU HÌNH THIẾT BỊ (CONTROL & CONFIG) */}
-        {activeTab === 'control' && (
+        {tab === 'control' && (
           <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
             {/* Khối Điều khiển Quạt */}
             <div className="bg-slate-900 border border-slate-800 p-6 rounded-lg space-y-4">
@@ -566,6 +429,7 @@ export default function App() {
               <p className="text-sm text-slate-400">
                 Gửi lệnh qua MQTT topic <code className="text-teal-300">command</code> và kích hoạt rơ-le trên ESP32.
               </p>
+              {!canControl && <p className="text-sm text-amber-300">{VIEW_ONLY}</p>}
               {isDeviceDataHidden && (
                 <p className="text-sm text-amber-300">
                   Không thể bật/tắt quạt khi thiết bị đang ở trạng thái {currentDev.lifecycle_status}.
@@ -575,14 +439,16 @@ export default function App() {
               <div className="flex gap-4 pt-4">
                 <button 
                   onClick={() => handleCommand('ON')}
-                  disabled={isDeviceDataHidden}
+                  disabled={!canControl || isDeviceDataHidden}
+                  title={!canControl ? VIEW_ONLY : undefined}
                   className="flex-1 py-3 bg-emerald-600 hover:bg-emerald-700 text-white font-semibold rounded flex items-center justify-center gap-2 disabled:cursor-not-allowed disabled:opacity-40 disabled:hover:bg-emerald-600"
                 >
                   <Power className="w-5 h-5" /> BẬT QUẠT
                 </button>
                 <button 
                   onClick={() => handleCommand('OFF')}
-                  disabled={isDeviceDataHidden}
+                  disabled={!canControl || isDeviceDataHidden}
+                  title={!canControl ? VIEW_ONLY : undefined}
                   className="flex-1 py-3 bg-red-600 hover:bg-red-700 text-white font-semibold rounded flex items-center justify-center gap-2 disabled:cursor-not-allowed disabled:opacity-40 disabled:hover:bg-red-600"
                 >
                   <Power className="w-5 h-5" /> TẮT QUẠT
@@ -596,13 +462,16 @@ export default function App() {
                 <Settings className="w-5 h-5 text-teal-400" /> Cấu Hình Tham Số Hoạt Động Từ Xa
               </h2>
               <form onSubmit={handleUpdateConfig} className="space-y-3">
+                <fieldset disabled={!canControl || isDeviceDataHidden} title={!canControl ? VIEW_ONLY : undefined}
+                  className="space-y-3 disabled:opacity-50">
                 <div className="grid grid-cols-2 gap-3">
                   <div>
                     <label className="text-xs text-slate-400">Chu kỳ gửi dữ liệu (ms):</label>
                     <input 
                       type="number" 
                       value={sendInterval} 
-                      onChange={e => setSendInterval(e.target.value)}
+                      onChange={e => updateConfigField('send_interval_ms', e.target.value)}
+                      min={1000} max={60000} required
                       className="w-full mt-1 p-2 bg-slate-800 border border-slate-700 rounded text-white text-sm" 
                     />
                   </div>
@@ -611,7 +480,8 @@ export default function App() {
                     <input 
                       type="number" 
                       value={tempThreshold} 
-                      onChange={e => setTempThreshold(e.target.value)}
+                      onChange={e => updateConfigField('temp_threshold', e.target.value)}
+                      step="any" required
                       className="w-full mt-1 p-2 bg-slate-800 border border-slate-700 rounded text-white text-sm" 
                     />
                   </div>
@@ -623,7 +493,8 @@ export default function App() {
                     <input 
                       type="number" 
                       value={eco2Threshold} 
-                      onChange={e => setEco2Threshold(e.target.value)}
+                      onChange={e => updateConfigField('eco2_threshold', e.target.value)}
+                      step="any" required
                       className="w-full mt-1 p-2 bg-slate-800 border border-slate-700 rounded text-white text-sm" 
                     />
                   </div>
@@ -632,7 +503,8 @@ export default function App() {
                     <input 
                       type="number" 
                       value={tvocThreshold} 
-                      onChange={e => setTvocThreshold(e.target.value)}
+                      onChange={e => updateConfigField('tvoc_threshold', e.target.value)}
+                      step="any" required
                       className="w-full mt-1 p-2 bg-slate-800 border border-teal-500 rounded text-white text-sm focus:outline-none" 
                     />
                   </div>
@@ -641,11 +513,12 @@ export default function App() {
                 <button type="submit" className="w-full py-2 bg-teal-500 hover:bg-teal-600 text-white font-medium rounded text-sm transition mt-2">
                   Cập Nhật Ngưỡng Xuống ESP32
                 </button>
+                </fieldset>
               </form>
             </div>
 
             {/* Khối Quản lý Vòng đời (Chỉ Admin) */}
-            {user?.role === 'ADMIN' && (
+            {isAdmin && (
               <div className="bg-slate-900 border border-slate-800 p-6 rounded-lg md:col-span-2 space-y-4">
                 <h2 className="text-base font-semibold text-white flex items-center gap-2">
                   <Lock className="w-5 h-5 text-purple-400" /> Quản Lý Vòng Đời Thiết Bị (Device Lifecycle - Mục 4.4b)
@@ -667,7 +540,7 @@ export default function App() {
         )}
 
         {/* TAB 3: DANH SÁCH CẢNH BÁO (ALERTS) */}
-        {activeTab === 'alerts' && (
+        {tab === 'alerts' && (
           <div className="bg-slate-900 border border-slate-800 rounded-lg overflow-hidden">
             <div className="p-4 border-b border-slate-800 flex justify-between items-center">
               <h2 className="font-semibold text-white flex items-center gap-2">
@@ -703,7 +576,7 @@ export default function App() {
                         {a.status === 'NEW' ? <span className="text-amber-400 font-bold">Mới</span> : <span className="text-slate-400">Đã xử lý</span>}
                       </td>
                       <td className="p-3 text-right">
-                        {a.status === 'NEW' && user?.role !== 'VIEWER' && (
+                        {a.status === 'NEW' && canControl && (
                           <button 
                             onClick={() => handleAckAlert(a.id)} 
                             className="px-3 py-1 bg-teal-600 hover:bg-teal-700 text-white rounded text-xs"
@@ -724,7 +597,7 @@ export default function App() {
         )}
 
         {/* TAB 4: QUẢN TRỊ & AUDIT LOGS */}
-        {activeTab === 'audit' && user?.role === 'ADMIN' && (
+        {tab === 'audit' && isAdmin && (
           <div className="bg-slate-900 border border-slate-800 rounded-lg overflow-hidden">
             <div className="p-4 border-b border-slate-800">
               <h2 className="font-semibold text-white flex items-center gap-2">

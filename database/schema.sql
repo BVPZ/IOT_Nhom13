@@ -35,7 +35,28 @@ CREATE TABLE IF NOT EXISTS devices (
     FOREIGN KEY (owner_id) REFERENCES users(id) ON DELETE SET NULL
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
--- 3. BẢNG LƯU TRỮ DỮ LIỆU CẢM BIẾN - TELEMETRY (Mục 4.4c)
+-- 3. QUYỀN TRUY CẬP THEO NODE
+CREATE TABLE IF NOT EXISTS device_permissions (
+    id INT NOT NULL AUTO_INCREMENT,
+    user_id INT NOT NULL,
+    device_id INT NOT NULL,
+    permission ENUM('VIEW', 'CONTROL') NOT NULL DEFAULT 'VIEW',
+    status ENUM('PENDING', 'APPROVED', 'REJECTED') NOT NULL DEFAULT 'APPROVED',
+    request_note VARCHAR(255) DEFAULT NULL,
+    granted_by INT DEFAULT NULL,
+    requested_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    granted_at TIMESTAMP NULL DEFAULT NULL,
+    PRIMARY KEY (id),
+    UNIQUE KEY uq_user_device (user_id, device_id),
+    KEY idx_device_id (device_id),
+    KEY idx_granted_by (granted_by),
+    KEY idx_status (status),
+    CONSTRAINT fk_dp_user FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+    CONSTRAINT fk_dp_device FOREIGN KEY (device_id) REFERENCES devices(id) ON DELETE CASCADE,
+    CONSTRAINT fk_dp_granted_by FOREIGN KEY (granted_by) REFERENCES users(id) ON DELETE SET NULL
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
+
+-- 4. BẢNG LƯU TRỮ DỮ LIỆU CẢM BIẾN - TELEMETRY (Mục 4.4c)
 CREATE TABLE IF NOT EXISTS telemetry_logs (
     id INT AUTO_INCREMENT PRIMARY KEY,
     device_id INT NOT NULL,
@@ -48,7 +69,7 @@ CREATE TABLE IF NOT EXISTS telemetry_logs (
     FOREIGN KEY (device_id) REFERENCES devices(id) ON DELETE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
--- 4. BẢNG GIÁM SÁT & LỊCH SỬ CẢNH BÁO (Mục 4.4d)
+-- 5. BẢNG GIÁM SÁT & LỊCH SỬ CẢNH BÁO (Mục 4.4d)
 CREATE TABLE IF NOT EXISTS alerts (
     id INT AUTO_INCREMENT PRIMARY KEY,
     device_id INT NOT NULL,
@@ -66,7 +87,7 @@ CREATE TABLE IF NOT EXISTS alerts (
     FOREIGN KEY (acknowledged_by) REFERENCES users(id) ON DELETE SET NULL
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
--- 5. BẢNG LỊCH SỬ ĐIỀU KHIỂN & PHẢN HỒI - COMMAND & ACK (Mục 4.4e)
+-- 6. BẢNG LỊCH SỬ ĐIỀU KHIỂN & PHẢN HỒI - COMMAND & ACK (Mục 4.4e)
 CREATE TABLE IF NOT EXISTS command_logs (
     id INT AUTO_INCREMENT PRIMARY KEY,
     cmd_code VARCHAR(50) UNIQUE NOT NULL,
@@ -83,7 +104,7 @@ CREATE TABLE IF NOT EXISTS command_logs (
     FOREIGN KEY (issued_by) REFERENCES users(id) ON DELETE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
--- 6. BẢNG NHẬT KÝ BẢO MẬT - AUDIT LOGS (Mục 4.5)
+-- 7. BẢNG NHẬT KÝ BẢO MẬT - AUDIT LOGS (Mục 4.5)
 CREATE TABLE IF NOT EXISTS audit_logs (
     id INT AUTO_INCREMENT PRIMARY KEY,
     user_id INT NULL,

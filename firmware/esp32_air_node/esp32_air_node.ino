@@ -17,14 +17,18 @@
 // =========================================================================
 // 2. ĐỊNH DANH THIẾT BỊ & TOPICS MQTT (Khớp với database/schema.sql)
 // =========================================================================
-const char* DEVICE_CODE   = "ESP32_NODE_01";
+#ifndef NODE_DEVICE_CODE
+#define NODE_DEVICE_CODE "ESP32_NODE_01"
+#endif
+
+const char* DEVICE_CODE   = NODE_DEVICE_CODE;
 const char* FIRMWARE_VER  = "v1.0.0";
 
-const char* TOPIC_TELEMETRY = "iot_nhom13/ESP32_NODE_01/telemetry";
-const char* TOPIC_STATUS    = "iot_nhom13/ESP32_NODE_01/status";
-const char* TOPIC_COMMAND   = "iot_nhom13/ESP32_NODE_01/command";
-const char* TOPIC_ACK       = "iot_nhom13/ESP32_NODE_01/ack";
-const char* TOPIC_CONFIG    = "iot_nhom13/ESP32_NODE_01/config";
+const char* TOPIC_TELEMETRY = "iot_nhom13/" NODE_DEVICE_CODE "/telemetry";
+const char* TOPIC_STATUS    = "iot_nhom13/" NODE_DEVICE_CODE "/status";
+const char* TOPIC_COMMAND   = "iot_nhom13/" NODE_DEVICE_CODE "/command";
+const char* TOPIC_ACK       = "iot_nhom13/" NODE_DEVICE_CODE "/ack";
+const char* TOPIC_CONFIG    = "iot_nhom13/" NODE_DEVICE_CODE "/config";
 
 // =========================================================================
 // 3. CẤU HÌNH CHÂN CẮM PHẦN CỨNG
@@ -257,10 +261,10 @@ void reconnectMQTT() {
   if (!mqttClient.connected()) {
     Serial.printf("[MQTT] Dang ket noi EMQX Cloud (TLS)... Heap RAM: %d bytes\n", ESP.getFreeHeap());
     
-    String clientId = "ESP32_NODE_01_PROD";
-    const char* lwtPayload = "{\"device_code\":\"ESP32_NODE_01\",\"status\":\"OFFLINE\"}";
+    const char* clientId = NODE_DEVICE_CODE "_PROD";
+    const char* lwtPayload = "{\"device_code\":\"" NODE_DEVICE_CODE "\",\"status\":\"OFFLINE\"}";
 
-    if (mqttClient.connect(clientId.c_str(), MQTT_USERNAME, MQTT_PASSWORD, 
+    if (mqttClient.connect(clientId, MQTT_USERNAME, MQTT_PASSWORD,
                            TOPIC_STATUS, 1, true, lwtPayload)) {
       Serial.println("[MQTT] KET NOI THANH CONG!");
       mqttClient.subscribe(TOPIC_COMMAND, 1);

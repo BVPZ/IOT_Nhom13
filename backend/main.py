@@ -3,8 +3,10 @@ import ssl
 import json
 import time
 import asyncio
+import secrets
+from contextlib import closing
 from datetime import datetime, timedelta
-from typing import Optional, List
+from typing import Annotated, Literal, Optional
 
 import jwt
 import bcrypt
@@ -12,10 +14,12 @@ import pymysql
 import pymysql.cursors
 import paho.mqtt.client as mqtt
 from dotenv import load_dotenv
-from fastapi import FastAPI, Depends, HTTPException, Request
+from fastapi import FastAPI, Depends, HTTPException, Query, Request
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field, StringConstraints, field_validator
 
 if __package__:
     from .telegram_notifier import send_telegram_alert
@@ -36,9 +40,7 @@ DB_PORT = int(os.getenv("DB_PORT", 3306))
 DB_USER = os.getenv("DB_USER", "avnadmin")
 DB_PASSWORD = os.getenv("DB_PASSWORD", "")
 DB_NAME = os.getenv("DB_NAME", "defaultdb")
-SCHEMA_PATH = "./database/schema.sql"
-
-JWT_SECRET = os.getenv("JWT_SECRET_KEY", "secret_key_nhom13")
+JWT_SECRET = os.getenv("JWT_SECRET_KEY") or secrets.token_urlsafe(48)
 JWT_ALGO = os.getenv("JWT_ALGORITHM", "HS256")
 
 app = FastAPI(title="IoT Air Quality MIS Backend (Aiven MySQL) - Nhom 13", version="1.0.0")
@@ -51,7 +53,15 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-security = HTTPBearer()
+security = HTTPBearer(auto_error=False)
+
+
+@app.exception_handler(RequestValidationError)
+async def validation_error_response(request: Request, exc: RequestValidationError):
+    # Validation errors can include the original password or other submitted values.
+    details = [{key: error[key] for key in ("loc", "msg", "type")} for error in exc.errors()]
+    return JSONResponse(status_code=422, content={"detail": details})
+
 
 # =========================================================================
 # 1. KẾT NỐI AIVEN MYSQL & TỰ ĐỘNG KHỞI TẠO BẢNG + DỮ LIỆU MẪU
@@ -67,6 +77,11 @@ def get_db():
         autocommit=False,
         ssl={" fake_flag_to_enable_tls": True} # Aiven MySQL yêu cầu kết nối SSL
     )
+
+
+def get_api_db():
+    with closing(get_db()) as connection:
+        yield connection
 
 def log_audit(user_id: Optional[int], action: str, target: str, details: str, ip: str = "127.0.0.1"):
     """Ghi Audit Log lên Aiven MySQL (Mục 4.5)"""
@@ -373,22 +388,73 @@ def startup_event():
 # =========================================================================
 # 3. XÁC THỰC JWT & PHÂN QUYỀN RBAC 3 VAI TRÒ (Mục 4.4a & 4.5)
 # =========================================================================
-def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(security)):
-    token = credentials.credentials
+def get_authenticated_user_id(credentials: HTTPAuthorizationCredentials | None = Depends(security)):
+    if credentials is None:
+        raise HTTPException(status_code=401, detail="Vui lòng đăng nhập")
     try:
-        return jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGO])
+        claims = jwt.decode(credentials.credentials, JWT_SECRET, algorithms=[JWT_ALGO], options={"require": ["exp"]})
+        user_id = claims["user_id"]
+        if type(user_id) is not int or user_id < 1:
+            raise ValueError("Invalid user ID")
+        return user_id
     except jwt.ExpiredSignatureError:
         raise HTTPException(status_code=401, detail="Token da het han, vui long dang nhap lai")
-    except Exception:
+    except (jwt.InvalidTokenError, KeyError, ValueError):
         raise HTTPException(status_code=401, detail="Token khong hop le")
 
-def require_roles(allowed_roles: List[str]):
-    def role_checker(request: Request, user: dict = Depends(get_current_user)):
-        if user["role"] not in allowed_roles:
-            log_audit(user["user_id"], "UNAUTHORIZED_ACCESS", request.url.path, f"Role {user['role']} bi chan truy cap", request.client.host)
-            raise HTTPException(status_code=403, detail=f"Quyen '{user['role']}' khong duoc phep thuc hien thao tac nay!")
-        return user
-    return role_checker
+
+def get_current_user(user_id: int = Depends(get_authenticated_user_id), conn=Depends(get_api_db)):
+    with conn.cursor() as cursor:
+        cursor.execute(
+            "SELECT id AS user_id, username, full_name, role FROM users WHERE id = %s AND is_active = 1",
+            (user_id,),
+        )
+        user = cursor.fetchone()
+    if not user:
+        raise HTTPException(status_code=401, detail="Tài khoản không hoạt động")
+    return user
+
+
+def require_admin(request: Request, user: dict = Depends(get_current_user)):
+    if user["role"] != "ADMIN":
+        log_audit(user["user_id"], "UNAUTHORIZED_ACCESS", request.url.path, "Yêu cầu quyền ADMIN", request.client.host)
+        raise HTTPException(status_code=403, detail="Thao tác này yêu cầu quyền admin")
+    return user
+
+
+Permission = Literal["VIEW", "CONTROL"]
+Role = Literal["ADMIN", "OPERATOR", "VIEWER"]
+DeviceId = Annotated[int, Field(gt=0)]
+DeviceCode = Annotated[str, StringConstraints(pattern=r"^[A-Za-z0-9_-]+$", min_length=1, max_length=50)]
+PermissionNote = Annotated[str, StringConstraints(strip_whitespace=True, max_length=255)]
+
+
+def enforce_permission(device, user, required_permission: Permission):
+    if user["role"] == "ADMIN":
+        return
+    if device["lifecycle_status"] == "DECOMMISSIONED" or device["access_status"] != "APPROVED":
+        raise HTTPException(status_code=403, detail="Bạn chưa được cấp quyền truy cập thiết bị này")
+    if required_permission == "CONTROL" and device["permission"] != "CONTROL":
+        raise HTTPException(status_code=403, detail="Bạn chỉ có quyền xem, không có quyền điều khiển thiết bị này")
+
+
+def verify_device_access(required_permission: Permission = "VIEW"):
+    def check_access(device_code: str, user: dict = Depends(get_current_user), conn=Depends(get_api_db)):
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """SELECT d.id, d.device_code, d.lifecycle_status, d.tvoc_threshold,
+                          p.status AS access_status, p.permission
+                   FROM devices d
+                   LEFT JOIN device_permissions p ON p.device_id = d.id AND p.user_id = %s
+                   WHERE d.device_code = %s""",
+                (user["user_id"], device_code),
+            )
+            device = cursor.fetchone()
+        if not device:
+            raise HTTPException(status_code=404, detail="Không tìm thấy thiết bị")
+        enforce_permission(device, user, required_permission)
+        return device
+    return check_access
 
 # =========================================================================
 # 4. CÁC MODELS DỮ LIỆU ĐẦU VÀO
@@ -408,15 +474,58 @@ class ConfigRequest(BaseModel):
     tvoc_threshold: Optional[float] = None
 
 class LifecycleRequest(BaseModel):
-    lifecycle_status: str
+    lifecycle_status: Literal["REGISTERED", "PROVISIONED", "ACTIVE", "OFFLINE", "MAINTENANCE", "DECOMMISSIONED"]
 
 class OnboardDeviceRequest(BaseModel):
-    device_code: str
-    device_name: str
-    location: str
+    device_code: DeviceCode
+    device_name: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=100)]
+    location: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=100)]
 
 class AckAlertRequest(BaseModel):
     resolve_note: str = "Da kiem tra va xu ly"
+
+
+class AccountRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    username: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=50)]
+    email: Annotated[str, StringConstraints(strip_whitespace=True, max_length=100, pattern=r"^[^\s@]+@[^\s@]+\.[^\s@]+$")]
+    password: Annotated[str, StringConstraints(min_length=8)]
+    full_name: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=100)]
+
+    @field_validator("password")
+    @classmethod
+    def validate_password_size(cls, password: str) -> str:
+        if len(password.encode("utf-8")) > 72:
+            raise ValueError("Mật khẩu tối đa 72 byte UTF-8")
+        return password
+
+
+class PermissionLevel(BaseModel):
+    permission: Permission
+
+
+class DeviceGrant(PermissionLevel):
+    device_id: DeviceId
+
+
+class AdminAccountRequest(AccountRequest):
+    role: Role = "VIEWER"
+    device_grants: list[DeviceGrant] = Field(default_factory=list)
+
+
+class AccessRequest(BaseModel):
+    device_id: DeviceId
+    requested_permission: Permission
+    request_note: PermissionNote | None = None
+
+
+class ReviewRequest(PermissionLevel):
+    action: Literal["APPROVE", "REJECT"]
+
+
+class ExistingUserGrant(DeviceGrant):
+    user_id: Annotated[int, Field(gt=0)]
 
 # =========================================================================
 # 5. CÁC API NGHIỆP VỤ (LƯU TRỰC TIẾP TRÊN AIVEN MYSQL)
@@ -444,19 +553,236 @@ def login(req: LoginRequest, request: Request):
     log_audit(user["id"], "USER_LOGIN", f"USER:{user['username']}", f"Dang nhap thanh cong voi quyen {user['role']}", request.client.host)
     return {"access_token": token, "user": token_payload}
 
-@app.get("/api/devices")
-def list_devices(user: dict = Depends(get_current_user)):
-    conn = get_db()
+
+@app.get("/api/auth/me")
+def current_account(user: dict = Depends(get_current_user)):
+    return user
+
+
+def select_grantable_device(cursor, device_id: int):
+    cursor.execute("SELECT lifecycle_status FROM devices WHERE id = %s FOR UPDATE", (device_id,))
+    device = cursor.fetchone()
+    if not device or device["lifecycle_status"] == "DECOMMISSIONED":
+        raise HTTPException(status_code=404, detail=f"Không tìm thấy node có thể cấp quyền (ID {device_id})")
+
+
+def create_account(req: AccountRequest, role: Role, grants: list[DeviceGrant], admin_id=None):
+    device_ids = {grant.device_id for grant in grants}
+    if len(device_ids) != len(grants):
+        raise HTTPException(status_code=400, detail="Mỗi node chỉ được chọn một lần")
+    password_hash = bcrypt.hashpw(req.password.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
+    with closing(get_db()) as conn:
+        try:
+            with conn.cursor() as cursor:
+                for device_id in sorted(device_ids):
+                    select_grantable_device(cursor, device_id)
+                cursor.execute(
+                    """INSERT INTO users (username, email, password_hash, full_name, role)
+                       VALUES (%s, %s, %s, %s, %s)""",
+                    (req.username, req.email, password_hash, req.full_name, role),
+                )
+                user_id = cursor.lastrowid
+                if grants:
+                    cursor.executemany(
+                        """INSERT INTO device_permissions (user_id, device_id, permission, status, granted_by, granted_at)
+                           VALUES (%s, %s, %s, 'APPROVED', %s, NOW())""",
+                        [(user_id, grant.device_id, grant.permission, admin_id) for grant in grants],
+                    )
+            conn.commit()
+        except pymysql.IntegrityError as exc:
+            if exc.args[0] != 1062:
+                raise
+            raise HTTPException(status_code=409, detail="Tên đăng nhập hoặc email đã tồn tại") from exc
+    log_audit(admin_id or user_id, "CREATE_USER", f"USER:{user_id}", f"Vai trò {role}, {len(grants)} quyền theo node")
+    return {"id": user_id, "username": req.username, "role": role}
+
+
+@app.post("/api/auth/register", status_code=201)
+def register(req: AccountRequest):
+    return create_account(req, "VIEWER", [])
+
+
+@app.post("/api/admin/users", status_code=201)
+def admin_create_user(req: AdminAccountRequest, admin: dict = Depends(require_admin)):
+    return create_account(req, req.role, req.device_grants, admin["user_id"])
+
+
+@app.get("/api/admin/users")
+def list_grantable_users(admin: dict = Depends(require_admin), conn=Depends(get_api_db)):
     with conn.cursor() as cursor:
-        cursor.execute("SELECT * FROM devices ORDER BY id ASC")
-        devices = cursor.fetchall()
-    conn.close()
-    return devices
+        cursor.execute(
+            """SELECT id, username, full_name, role FROM users
+               WHERE role <> 'ADMIN' AND is_active = 1 ORDER BY username"""
+        )
+        return cursor.fetchall()
+
+
+@app.get("/api/devices/catalog")
+def list_device_catalog(user: dict = Depends(get_current_user), conn=Depends(get_api_db)):
+    fields = "d.id, d.device_code, d.device_name, d.location, d.lifecycle_status"
+    with conn.cursor() as cursor:
+        if user["role"] == "ADMIN":
+            cursor.execute(
+                f"""SELECT {fields}, 'APPROVED' AS access_status, 'CONTROL' AS permission
+                    FROM devices d WHERE d.lifecycle_status <> 'DECOMMISSIONED' ORDER BY d.id"""
+            )
+        else:
+            cursor.execute(
+                f"""SELECT {fields}, p.status AS access_status, p.permission
+                    FROM devices d
+                    LEFT JOIN device_permissions p ON p.device_id = d.id AND p.user_id = %s
+                    WHERE d.lifecycle_status <> 'DECOMMISSIONED' ORDER BY d.id""",
+                (user["user_id"],),
+            )
+        return cursor.fetchall()
+
+
+@app.post("/api/permissions/request", status_code=201)
+def request_device_permission(req: AccessRequest, user: dict = Depends(get_current_user), conn=Depends(get_api_db)):
+    if user["role"] == "ADMIN":
+        raise HTTPException(status_code=400, detail="Admin đã có quyền truy cập mọi node")
+    with conn.cursor() as cursor:
+        select_grantable_device(cursor, req.device_id)
+        cursor.execute(
+            "SELECT id, status FROM device_permissions WHERE user_id = %s AND device_id = %s FOR UPDATE",
+            (user["user_id"], req.device_id),
+        )
+        existing = cursor.fetchone()
+        if existing and existing["status"] != "REJECTED":
+            raise HTTPException(status_code=400, detail="Bạn đã có quyền hoặc đang có yêu cầu chờ duyệt cho thiết bị này")
+        if existing:
+            permission_id = existing["id"]
+            cursor.execute(
+                """UPDATE device_permissions SET status = 'PENDING', permission = %s, request_note = %s,
+                          requested_at = NOW(), granted_by = NULL, granted_at = NULL WHERE id = %s""",
+                (req.requested_permission, req.request_note, permission_id),
+            )
+        else:
+            cursor.execute(
+                """INSERT INTO device_permissions (user_id, device_id, permission, status, request_note)
+                   VALUES (%s, %s, %s, 'PENDING', %s)""",
+                (user["user_id"], req.device_id, req.requested_permission, req.request_note),
+            )
+            permission_id = cursor.lastrowid
+    conn.commit()
+    return {"id": permission_id, "status": "PENDING"}
+
+
+def list_permissions(conn, status: Literal["PENDING", "APPROVED"]):
+    with conn.cursor() as cursor:
+        cursor.execute(
+            """SELECT p.id, p.user_id, p.device_id, p.permission, p.status, p.request_note,
+                      p.requested_at, p.granted_at, u.username, u.full_name, d.device_code,
+                      d.device_name, d.lifecycle_status
+               FROM device_permissions p JOIN users u ON u.id = p.user_id
+               JOIN devices d ON d.id = p.device_id
+               WHERE p.status = %s ORDER BY p.requested_at DESC, p.id DESC""",
+            (status,),
+        )
+        return cursor.fetchall()
+
+
+@app.get("/api/admin/permissions/pending")
+def pending_permissions(admin: dict = Depends(require_admin), conn=Depends(get_api_db)):
+    return list_permissions(conn, "PENDING")
+
+
+@app.get("/api/admin/permissions")
+def approved_permissions(admin: dict = Depends(require_admin), conn=Depends(get_api_db)):
+    return list_permissions(conn, "APPROVED")
+
+
+@app.post("/api/admin/permissions")
+def grant_permission(req: ExistingUserGrant, admin: dict = Depends(require_admin), conn=Depends(get_api_db)):
+    with conn.cursor() as cursor:
+        select_grantable_device(cursor, req.device_id)
+        cursor.execute("SELECT role, is_active FROM users WHERE id = %s FOR UPDATE", (req.user_id,))
+        user = cursor.fetchone()
+        if not user or not user["is_active"] or user["role"] == "ADMIN":
+            raise HTTPException(status_code=404, detail="Không tìm thấy tài khoản có thể cấp quyền theo node")
+        cursor.execute(
+            """INSERT INTO device_permissions (user_id, device_id, permission, status, granted_by, granted_at)
+               VALUES (%s, %s, %s, 'APPROVED', %s, NOW())
+               ON DUPLICATE KEY UPDATE permission = %s, status = 'APPROVED', granted_by = %s, granted_at = NOW()""",
+            (req.user_id, req.device_id, req.permission, admin["user_id"], req.permission, admin["user_id"]),
+        )
+    conn.commit()
+    log_audit(admin["user_id"], "GRANT_DEVICE_ACCESS", f"DEVICE:{req.device_id}", f"User {req.user_id}: {req.permission}")
+    return {"status": "APPROVED", "permission": req.permission}
+
+
+@app.put("/api/admin/permissions/{permission_id}/review")
+def review_permission(permission_id: int, req: ReviewRequest, admin: dict = Depends(require_admin), conn=Depends(get_api_db)):
+    status = "APPROVED" if req.action == "APPROVE" else "REJECTED"
+    with conn.cursor() as cursor:
+        cursor.execute(
+            """UPDATE device_permissions p JOIN devices d ON d.id = p.device_id
+               SET p.status = %s, p.permission = %s, p.granted_by = %s, p.granted_at = NOW()
+               WHERE p.id = %s AND p.status = 'PENDING'
+                 AND (%s = 'REJECTED' OR d.lifecycle_status <> 'DECOMMISSIONED')""",
+            (status, req.permission, admin["user_id"], permission_id, status),
+        )
+        if not cursor.rowcount:
+            raise HTTPException(status_code=409, detail="Yêu cầu đã được xử lý hoặc node đã ngừng hoạt động")
+    conn.commit()
+    log_audit(admin["user_id"], "REVIEW_DEVICE_ACCESS", f"PERMISSION:{permission_id}", f"{status}: {req.permission}")
+    return {"status": status, "permission": req.permission}
+
+
+@app.put("/api/admin/permissions/{permission_id}")
+def change_permission(permission_id: int, req: PermissionLevel, admin: dict = Depends(require_admin), conn=Depends(get_api_db)):
+    with conn.cursor() as cursor:
+        cursor.execute("SELECT status FROM device_permissions WHERE id = %s FOR UPDATE", (permission_id,))
+        existing = cursor.fetchone()
+        if not existing or existing["status"] != "APPROVED":
+            raise HTTPException(status_code=404, detail="Không tìm thấy quyền đang hoạt động")
+        cursor.execute(
+            "UPDATE device_permissions SET permission = %s, granted_by = %s, granted_at = NOW() WHERE id = %s",
+            (req.permission, admin["user_id"], permission_id),
+        )
+    conn.commit()
+    log_audit(admin["user_id"], "CHANGE_DEVICE_ACCESS", f"PERMISSION:{permission_id}", req.permission)
+    return {"status": "APPROVED", "permission": req.permission}
+
+
+@app.delete("/api/admin/permissions/{permission_id}")
+def revoke_permission(permission_id: int, admin: dict = Depends(require_admin), conn=Depends(get_api_db)):
+    with conn.cursor() as cursor:
+        cursor.execute("DELETE FROM device_permissions WHERE id = %s AND status = 'APPROVED'", (permission_id,))
+        if not cursor.rowcount:
+            raise HTTPException(status_code=404, detail="Không tìm thấy quyền đang hoạt động")
+    conn.commit()
+    log_audit(admin["user_id"], "REVOKE_DEVICE_ACCESS", f"PERMISSION:{permission_id}", "Thu hồi quyền theo node")
+    return {"message": "Đã thu hồi quyền"}
+
+
+def approved_device_scope(user):
+    if user["role"] == "ADMIN":
+        return "", "1 = 1", ()
+    return (
+        "JOIN device_permissions p ON p.device_id = d.id",
+        "p.user_id = %s AND p.status = 'APPROVED' AND d.lifecycle_status <> 'DECOMMISSIONED'",
+        (user["user_id"],),
+    )
+
+
+@app.get("/api/devices")
+def list_devices(user: dict = Depends(get_current_user), conn=Depends(get_api_db)):
+    join, where, params = approved_device_scope(user)
+    permission = "'CONTROL'" if user["role"] == "ADMIN" else "p.permission"
+    with conn.cursor() as cursor:
+        cursor.execute(
+            f"""SELECT d.id, d.device_code, d.device_name, d.location, d.owner_id, d.hardware_version,
+                       d.firmware_version, d.lifecycle_status, d.is_online, d.send_interval_ms, d.eco2_threshold,
+                       d.tvoc_threshold, d.temp_threshold, d.last_seen_at, d.created_at, {permission} AS permission
+                FROM devices d {join} WHERE {where} ORDER BY d.id""",
+            params,
+        )
+        return cursor.fetchall()
 
 @app.post("/api/devices/onboard")
-def onboard_device(req: OnboardDeviceRequest, user: dict = Depends(require_roles(["ADMIN"]))):
-    secret_token = f"sec_tok_{req.device_code.lower()}_{int(time.time())}"
-    conn = get_db()
+def onboard_device(req: OnboardDeviceRequest, user: dict = Depends(require_admin), conn=Depends(get_api_db)):
+    secret_token = secrets.token_urlsafe(32)
     try:
         with conn.cursor() as cursor:
             cursor.execute(
@@ -465,67 +791,63 @@ def onboard_device(req: OnboardDeviceRequest, user: dict = Depends(require_roles
                 (req.device_code, req.device_name, secret_token, req.location, user["user_id"])
             )
         conn.commit()
-    except pymysql.IntegrityError:
-        conn.close()
-        raise HTTPException(status_code=400, detail="Ma thiet bi (device_code) da ton tai!")
-    conn.close()
+    except pymysql.IntegrityError as exc:
+        if exc.args[0] != 1062:
+            raise
+        raise HTTPException(status_code=409, detail="Mã thiết bị đã tồn tại") from exc
     log_audit(user["user_id"], "ONBOARD_DEVICE", f"DEVICE:{req.device_code}", "Dang ky va cap token cho thiet bi moi")
     return {"message": "Dang ky thiet bi thanh cong", "device_code": req.device_code, "secret_token": secret_token}
 
 @app.put("/api/devices/{device_code}/lifecycle")
-def change_device_lifecycle(device_code: str, req: LifecycleRequest, user: dict = Depends(require_roles(["ADMIN"]))):
-    conn = get_db()
-    is_online = 0 if req.lifecycle_status in ("DECOMMISSIONED", "OFFLINE") else 1
+def change_device_lifecycle(device_code: str, req: LifecycleRequest, user: dict = Depends(require_admin), conn=Depends(get_api_db)):
     with conn.cursor() as cursor:
         cursor.execute(
-            "UPDATE devices SET lifecycle_status = %s, is_online = %s WHERE device_code = %s",
-            (req.lifecycle_status, is_online, device_code)
+            "SELECT id FROM devices WHERE device_code = %s FOR UPDATE", (device_code,)
+        )
+        device = cursor.fetchone()
+        if not device:
+            raise HTTPException(status_code=404, detail="Không tìm thấy thiết bị")
+        cursor.execute(
+            """UPDATE devices SET lifecycle_status = %s,
+                      is_online = CASE WHEN %s IN ('DECOMMISSIONED', 'OFFLINE') THEN 0 ELSE is_online END
+               WHERE id = %s""",
+            (req.lifecycle_status, req.lifecycle_status, device["id"]),
         )
     conn.commit()
-    conn.close()
     log_audit(user["user_id"], "CHANGE_LIFECYCLE", f"DEVICE:{device_code}", f"Chuyen trang thai sang {req.lifecycle_status}")
     return {"message": f"Da chuyen trang thai thiet bi {device_code} sang {req.lifecycle_status}"}
 
 @app.get("/api/devices/{device_code}/telemetry")
-def get_telemetry(device_code: str, limit: int = 30, user: dict = Depends(get_current_user)):
-    conn = get_db()
+def get_telemetry(
+    limit: int = Query(default=30, ge=1, le=5000),
+    device: dict = Depends(verify_device_access()),
+    conn=Depends(get_api_db),
+):
+    if device["lifecycle_status"] in ("MAINTENANCE", "DECOMMISSIONED"):
+        return []
     with conn.cursor() as cursor:
-        cursor.execute(
-            "SELECT id, lifecycle_status FROM devices WHERE device_code = %s",
-            (device_code,)
-        )
-        device = cursor.fetchone()
-        if not device:
-            conn.close()
-            raise HTTPException(status_code=404, detail="Khong tim thay thiet bi")
-        if device["lifecycle_status"] in ("MAINTENANCE", "DECOMMISSIONED"):
-            conn.close()
-            return []
         cursor.execute(
             "SELECT * FROM telemetry_logs WHERE device_id = %s ORDER BY id DESC LIMIT %s",
             (device["id"], limit)
         )
         rows = cursor.fetchall()
-    conn.close()
     return list(reversed(rows))
 
 @app.post("/api/devices/{device_code}/command")
-def send_command(device_code: str, req: CommandRequest, user: dict = Depends(require_roles(["ADMIN", "OPERATOR"]))):
-    conn = get_db()
+def send_command(
+    req: CommandRequest,
+    device: dict = Depends(verify_device_access("CONTROL")),
+    user: dict = Depends(get_current_user),
+    conn=Depends(get_api_db),
+):
+    device_code = device["device_code"]
+    if device["lifecycle_status"] in ("MAINTENANCE", "DECOMMISSIONED"):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Thiet bi dang o trang thai {device['lifecycle_status']}, khong the dieu khien!"
+        )
     with conn.cursor() as cursor:
-        cursor.execute("SELECT * FROM devices WHERE device_code = %s", (device_code,))
-        device = cursor.fetchone()
-        if not device:
-            conn.close()
-            raise HTTPException(status_code=404, detail="Khong tim thay thiet bi")
-        if device["lifecycle_status"] in ("MAINTENANCE", "DECOMMISSIONED"):
-            conn.close()
-            raise HTTPException(
-                status_code=400,
-                detail=f"Thiet bi dang o trang thai {device['lifecycle_status']}, khong the dieu khien!"
-            )
-
-        cmd_code = f"CMD_{int(time.time() * 1000)}"
+        cmd_code = f"CMD_{secrets.token_hex(16)}"
         payload = {
             "cmd_code": cmd_code,
             "target": req.target,
@@ -540,21 +862,21 @@ def send_command(device_code: str, req: CommandRequest, user: dict = Depends(req
             (cmd_code, device["id"], user["user_id"], req.target, req.action, json.dumps(payload))
         )
     conn.commit()
-    conn.close()
     log_audit(user["user_id"], "SEND_COMMAND", f"DEVICE:{device_code}", f"Gui lenh {req.action} toi {req.target} ({cmd_code})")
     return {"message": "Da gui lenh dieu khien, dang cho phan hoi ACK tu ESP32", "cmd_code": cmd_code}
 
 @app.put("/api/devices/{device_code}/config")
-def update_remote_config(device_code: str, req: ConfigRequest, user: dict = Depends(require_roles(["ADMIN", "OPERATOR"]))):
-    conn = get_db()
+def update_remote_config(
+    req: ConfigRequest,
+    device: dict = Depends(verify_device_access("CONTROL")),
+    user: dict = Depends(get_current_user),
+    conn=Depends(get_api_db),
+):
+    device_code = device["device_code"]
+    if device["lifecycle_status"] in ("MAINTENANCE", "DECOMMISSIONED"):
+        raise HTTPException(status_code=400, detail="Chỉ có thể cấu hình node đang khả dụng")
     with conn.cursor() as cursor:
-        cursor.execute("SELECT * FROM devices WHERE device_code = %s", (device_code,))
-        device = cursor.fetchone()
-        if not device:
-            conn.close()
-            raise HTTPException(status_code=404, detail="Khong tim thay thiet bi")
-
-        cmd_code = f"CFG_{int(time.time() * 1000)}"
+        cmd_code = f"CFG_{secrets.token_hex(16)}"
         tvoc_threshold = (
             req.tvoc_threshold
             if req.tvoc_threshold is not None
@@ -588,7 +910,6 @@ def update_remote_config(device_code: str, req: ConfigRequest, user: dict = Depe
             )
         )
     conn.commit()
-    conn.close()
     log_audit(
         user["user_id"], "UPDATE_CONFIG", f"DEVICE:{device_code}",
         f"Cap nhat chu ky {req.send_interval_ms}ms, nguong eCO2 {req.eco2_threshold}ppm, "
@@ -611,42 +932,63 @@ def update_remote_config(device_code: str, req: ConfigRequest, user: dict = Depe
     }
 
 @app.get("/api/commands")
-def list_commands(user: dict = Depends(get_current_user)):
-    conn = get_db()
+def list_commands(user: dict = Depends(get_current_user), conn=Depends(get_api_db)):
+    join, where, params = approved_device_scope(user)
     with conn.cursor() as cursor:
         cursor.execute(
-            """SELECT c.*, u.username FROM command_logs c 
-               LEFT JOIN users u ON c.issued_by = u.id 
-               ORDER BY c.id DESC LIMIT 20"""
+            f"""SELECT c.*, u.username FROM command_logs c
+                JOIN devices d ON d.id = c.device_id {join}
+                LEFT JOIN users u ON c.issued_by = u.id
+                WHERE {where} ORDER BY c.id DESC LIMIT 20""",
+            params,
         )
-        rows = cursor.fetchall()
-    conn.close()
-    return rows
+        return cursor.fetchall()
 
 @app.get("/api/alerts")
-def list_alerts(user: dict = Depends(get_current_user)):
-    conn = get_db()
+def list_alerts(user: dict = Depends(get_current_user), conn=Depends(get_api_db)):
+    join, where, params = approved_device_scope(user)
     with conn.cursor() as cursor:
-        cursor.execute("SELECT * FROM alerts ORDER BY id DESC LIMIT 30")
-        rows = cursor.fetchall()
-    conn.close()
-    return rows
+        cursor.execute(
+            f"""SELECT a.* FROM alerts a JOIN devices d ON d.id = a.device_id {join}
+                WHERE {where} ORDER BY a.id DESC LIMIT 30""",
+            params,
+        )
+        return cursor.fetchall()
+
+
+@app.get("/api/devices/{device_code}/alerts")
+def list_device_alerts(device: dict = Depends(verify_device_access()), conn=Depends(get_api_db)):
+    with conn.cursor() as cursor:
+        cursor.execute("SELECT * FROM alerts WHERE device_id = %s ORDER BY id DESC LIMIT 30", (device["id"],))
+        return cursor.fetchall()
+
 
 @app.put("/api/alerts/{alert_id}/acknowledge")
-def acknowledge_alert(alert_id: int, req: AckAlertRequest, user: dict = Depends(require_roles(["ADMIN", "OPERATOR"]))):
-    conn = get_db()
+def acknowledge_alert(
+    alert_id: int, req: AckAlertRequest, user: dict = Depends(get_current_user), conn=Depends(get_api_db),
+):
     with conn.cursor() as cursor:
+        cursor.execute(
+            """SELECT d.lifecycle_status, p.status AS access_status, p.permission
+               FROM alerts a JOIN devices d ON d.id = a.device_id
+               LEFT JOIN device_permissions p ON p.device_id = d.id AND p.user_id = %s
+               WHERE a.id = %s""",
+            (user["user_id"], alert_id),
+        )
+        device = cursor.fetchone()
+        if not device:
+            raise HTTPException(status_code=404, detail="Không tìm thấy cảnh báo")
+        enforce_permission(device, user, "CONTROL")
         cursor.execute(
             "UPDATE alerts SET status = 'ACKNOWLEDGED', acknowledged_by = %s, acknowledged_at = NOW(), resolve_note = %s WHERE id = %s",
             (user["user_id"], req.resolve_note, alert_id)
         )
     conn.commit()
-    conn.close()
     log_audit(user["user_id"], "ACK_ALERT", f"ALERT:{alert_id}", req.resolve_note)
     return {"message": "Da xac nhan xu ly canh bao"}
 
 @app.get("/api/audit-logs")
-def list_audit_logs(user: dict = Depends(require_roles(["ADMIN"]))):
+def list_audit_logs(user: dict = Depends(require_admin)):
     conn = get_db()
     with conn.cursor() as cursor:
         cursor.execute(
