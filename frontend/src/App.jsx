@@ -161,7 +161,7 @@ function Dashboard({ token, onLogout }) {
         try {
           setLiveStatus('connecting');
           const response = await fetch(`${api.defaults.baseURL}/devices/${encodeURIComponent(detailCode)}/live`, {
-            headers: { Authorization: api.defaults.headers.common.Authorization },
+            headers: { Authorization: `Bearer ${token}` },
             signal: controller.signal,
           });
           if (response.status === 404) {
@@ -217,7 +217,7 @@ function Dashboard({ token, onLogout }) {
       window.clearTimeout(reconnectTimeout);
       reader?.cancel().catch(() => {});
     };
-  }, [api, detailCode, onLogout]);
+  }, [api, detailCode, onLogout, token]);
 
   useEffect(() => {
     if (tab !== 'audit') return;
