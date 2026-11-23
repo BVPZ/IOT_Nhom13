@@ -65,26 +65,37 @@ export default function DeviceCatalog({ devices, loaded, api, onOpen, onRequeste
       <h2 id="catalog-title" className="text-xl font-semibold">Danh mục thiết bị</h2>
       {loaded && devices.length === 0 && <p className="text-sm text-slate-400">Danh mục hiện chưa có node.</p>}
       <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
-        {devices.map(device => (
-          <article key={device.id} className="space-y-2 rounded-lg border border-slate-800 bg-slate-900 p-5">
-            <h3 className="font-semibold">{device.device_name}</h3>
-            <p className="text-sm text-slate-400">{device.device_code} · {device.location}</p>
-            <p className="text-xs text-slate-400">Vòng đời {device.lifecycle_status}</p>
-            {device.access_status === 'APPROVED' ? (
-              <div className="flex flex-wrap items-center justify-between gap-2 pt-2">
-                <span className="text-sm font-medium text-teal-300">{permissions[device.permission]}</span>
-                <button onClick={() => onOpen(device.device_code)} className={buttonClass}>Mở giám sát</button>
-              </div>
-            ) : device.access_status === 'PENDING' ? (
-              <p className="pt-2 text-sm text-amber-300">Đang chờ admin phê duyệt</p>
-            ) : (
-              <div className="flex flex-wrap items-center justify-between gap-2 pt-2">
-                <span className="text-sm text-slate-400">{device.access_status === 'REJECTED' ? 'Yêu cầu đã bị từ chối' : 'Chưa có quyền xem số liệu'}</span>
-                <button onClick={() => setRequestDevice(device)} className={buttonClass}>Xin quyền truy cập</button>
-              </div>
-            )}
-          </article>
-        ))}
+        {devices.map(device => {
+          const decommissioned = device.lifecycle_status === 'DECOMMISSIONED';
+          return (
+            <article key={device.id} className="space-y-2 rounded-lg border border-slate-800 bg-slate-900 p-5">
+              <h3 className="font-semibold">{device.device_name}</h3>
+              <p className="text-sm text-slate-400">{device.device_code} · {device.location}</p>
+              {decommissioned ? (
+                <p className="text-sm text-amber-300">Đang ngừng hoạt động (DECOMMISSIONED)</p>
+              ) : (
+                <p className="text-xs text-slate-400">Vòng đời {device.lifecycle_status}</p>
+              )}
+              {decommissioned ? (
+                <button onClick={() => onOpen(device.device_code, 'control')} className={buttonClass}>
+                  Quản lý vòng đời
+                </button>
+              ) : device.access_status === 'APPROVED' ? (
+                <div className="flex flex-wrap items-center justify-between gap-2 pt-2">
+                  <span className="text-sm font-medium text-teal-300">{permissions[device.permission]}</span>
+                  <button onClick={() => onOpen(device.device_code)} className={buttonClass}>Mở giám sát</button>
+                </div>
+              ) : device.access_status === 'PENDING' ? (
+                <p className="pt-2 text-sm text-amber-300">Đang chờ admin phê duyệt</p>
+              ) : (
+                <div className="flex flex-wrap items-center justify-between gap-2 pt-2">
+                  <span className="text-sm text-slate-400">{device.access_status === 'REJECTED' ? 'Yêu cầu đã bị từ chối' : 'Chưa có quyền xem số liệu'}</span>
+                  <button onClick={() => setRequestDevice(device)} className={buttonClass}>Xin quyền truy cập</button>
+                </div>
+              )}
+            </article>
+          );
+        })}
       </div>
       {requestDevice && (
         <RequestDialog device={requestDevice} api={api} onClose={() => setRequestDevice(null)}

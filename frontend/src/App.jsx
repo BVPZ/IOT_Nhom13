@@ -64,12 +64,17 @@ function Dashboard({ token, onLogout }) {
   const [activeTab, setActiveTab] = useState('catalog');
   const [selectedDevice, setSelectedDevice] = useState('');
   const [details, setDetails] = useState(null);
+  const [liveSamples, setLiveSamples] = useState([]);
+  const [liveStatus, setLiveStatus] = useState('connecting');
   const [auditLogs, setAuditLogs] = useState([]);
   const [actionMsg, setActionMsg] = useState('');
   const [revision, setRevision] = useState(0);
   const [configEdits, setConfigEdits] = useState({});
   const refreshDevices = useCallback(() => setRevision(value => value + 1), []);
   const isAdmin = account?.role === 'ADMIN';
+  const visibleCatalog = isAdmin
+    ? devices.map(device => ({ ...device, access_status: 'APPROVED', permission: 'CONTROL' }))
+    : catalog;
   const currentDev = devices.find(device => device.device_code === selectedDevice);
   const tab = (DETAIL_TABS.includes(activeTab) && !currentDev)
     || (['admin', 'audit'].includes(activeTab) && !isAdmin) ? 'catalog' : activeTab;
@@ -78,7 +83,10 @@ function Dashboard({ token, onLogout }) {
   const selectedDetails = currentDev && details?.deviceCode === selectedDevice ? details : null;
   const telemetry = selectedDetails?.telemetry || [];
   const alerts = selectedDetails?.alerts || [];
-  const latest = telemetry.at(-1) || { Temp: '—', Hum: '—', eCO2: '—', TVOC: '—' };
+  const currentLiveSamples = liveSamples.filter(sample => sample.deviceCode === selectedDevice);
+  const livePoint = currentLiveSamples.at(-1)?.point;
+  const chartTelemetry = [...telemetry, ...currentLiveSamples.map(sample => sample.point)].slice(-60);
+  const latest = livePoint || telemetry.at(-1) || { Temp: '—', Hum: '—', eCO2: '—', TVOC: '—' };
   const config = {
     send_interval_ms: currentDev?.send_interval_ms ?? 5000,
     eco2_threshold: currentDev?.eco2_threshold ?? 1500,
@@ -91,14 +99,15 @@ function Dashboard({ token, onLogout }) {
 
   useEffect(() => poll(async signal => {
     try {
-      const [userResponse, catalogResponse, devicesResponse] = await Promise.all([
+      const [userResponse, devicesResponse] = await Promise.all([
         api.get('/auth/me', { signal }),
-        api.get('/devices/catalog', { signal }),
         api.get('/devices', { signal }),
       ]);
+      const user = userResponse.data;
+      const userCatalog = user.role === 'ADMIN' ? [] : (await api.get('/devices/catalog', { signal })).data;
       if (signal.aborted) return;
-      setAccount(userResponse.data);
-      setCatalog(catalogResponse.data);
+      setAccount(user);
+      setCatalog(userCatalog);
       setDevices(devicesResponse.data);
       setSelectedDevice(code => devicesResponse.data.some(device => device.device_code === code) ? code : '');
       setApiStatus('ready');
@@ -112,6 +121,7 @@ function Dashboard({ token, onLogout }) {
   const detailCode = currentDev && DETAIL_TABS.includes(tab) ? currentDev.device_code : '';
   useEffect(() => {
     if (!detailCode) return;
+    setLiveStatus('connecting');
     const path = `/devices/${encodeURIComponent(detailCode)}`;
     return poll(async signal => {
       try {
@@ -143,6 +153,73 @@ function Dashboard({ token, onLogout }) {
   }, [api, detailCode, onLogout, revision]);
 
   useEffect(() => {
+    if (!detailCode) return;
+    const controller = new AbortController();
+    let reader;
+    const connect = async () => {
+      while (!controller.signal.aborted) {
+        try {
+          setLiveStatus('connecting');
+          const response = await fetch(`${api.defaults.baseURL}/devices/${encodeURIComponent(detailCode)}/live`, {
+            headers: { Authorization: api.defaults.headers.common.Authorization },
+            signal: controller.signal,
+          });
+          if (response.status === 404) {
+            setLiveStatus('unsupported');
+            break;
+          }
+          if (response.status === 401) {
+            onLogout();
+            break;
+          }
+          if (!response.ok || !response.body) throw new Error(`Live stream failed (${response.status})`);
+          setLiveStatus('connected');
+          reader = response.body.getReader();
+          const decoder = new TextDecoder();
+          let buffer = '';
+          while (!controller.signal.aborted) {
+            const { value, done } = await reader.read();
+            if (done) break;
+            buffer += decoder.decode(value, { stream: true });
+            const events = buffer.split('\n\n');
+            buffer = events.pop() || '';
+            for (const event of events) {
+              const dataLine = event.split(/\r?\n/).find(line => line.startsWith('data: '));
+              if (!dataLine) continue;
+              const update = JSON.parse(dataLine.slice(6));
+              const sample = update.sample;
+              const point = {
+                sequence: update.sequence,
+                time: sample.recorded_at?.split(/[T ]/)[1]?.slice(0, 8) || '',
+                Temp: sample.temperature, Hum: sample.humidity,
+                eCO2: sample.eco2, TVOC: sample.tvoc,
+              };
+              setLiveSamples(previous => {
+                const deviceSamples = previous.filter(item => item.deviceCode === detailCode);
+                if (deviceSamples.some(item => item.point.sequence === point.sequence)) return previous;
+                return [...previous.filter(item => item.deviceCode !== detailCode),
+                  ...deviceSamples, { deviceCode: detailCode, point }].slice(-120);
+              });
+            }
+          }
+          if (!controller.signal.aborted) setLiveStatus('disconnected');
+        } catch (error) {
+          if (controller.signal.aborted) break;
+          setLiveStatus('disconnected');
+        }
+        await new Promise(resolve => { reconnectTimeout = window.setTimeout(resolve, 1500); });
+      }
+    };
+    let reconnectTimeout;
+    connect();
+    return () => {
+      controller.abort();
+      window.clearTimeout(reconnectTimeout);
+      reader?.cancel().catch(() => {});
+    };
+  }, [api, detailCode, onLogout]);
+
+  useEffect(() => {
     if (tab !== 'audit') return;
     return poll(async signal => {
       try {
@@ -159,6 +236,7 @@ function Dashboard({ token, onLogout }) {
   function openDevice(code, nextTab = 'monitoring') {
     if (code !== selectedDevice) {
       setDetails(null);
+      setLiveSamples([]);
       setConfigEdits({});
       setActionMsg('');
     }
@@ -308,9 +386,9 @@ function Dashboard({ token, onLogout }) {
 
       {/* Tab Content Area */}
       <main className="p-6 flex-1 overflow-auto space-y-6">
-        {tab === 'catalog' && <DeviceCatalog devices={catalog} loaded={Boolean(account)} api={api} onOpen={openDevice}
+        {tab === 'catalog' && <DeviceCatalog devices={visibleCatalog} loaded={Boolean(account)} api={api} onOpen={openDevice}
           onRequested={() => { setActionMsg('Đã gửi yêu cầu truy cập.'); refreshDevices(); }} />}
-        {tab === 'admin' && <AdminAccess api={api} catalog={catalog} devices={devices} refreshDevices={refreshDevices} openDevice={openDevice} />}
+        {tab === 'admin' && <AdminAccess api={api} catalog={visibleCatalog} devices={devices} refreshDevices={refreshDevices} openDevice={openDevice} />}
         {detailCode && selectedDetails?.error && <p role="alert" className="text-sm text-amber-300">{selectedDetails.error}</p>}
 
         {/* Device Status Bar */}
@@ -396,10 +474,16 @@ function Dashboard({ token, onLogout }) {
             <div className="bg-slate-900 border border-slate-800 p-5 rounded-lg">
               <h2 className="text-base font-semibold text-white mb-4 flex items-center gap-2">
                 <Activity className="w-5 h-5 text-teal-400" /> Biểu đồ diễn biến chất lượng không khí
+                <span className={`ml-auto inline-flex items-center gap-1.5 text-xs ${liveStatus === 'connected' ? 'text-emerald-400' : 'text-amber-300'}`}>
+                  <span className={`h-2 w-2 rounded-full ${liveStatus === 'connected' ? 'bg-emerald-400 animate-pulse' : 'bg-amber-300'}`} />
+                  {liveStatus === 'connected' ? 'Đang nhận trực tiếp'
+                    : liveStatus === 'unsupported' ? 'Backend chưa hỗ trợ luồng trực tiếp'
+                      : liveStatus === 'disconnected' ? 'Mất kết nối, đang thử lại' : 'Đang kết nối...'}
+                </span>
               </h2>
               <div className="h-72 w-full">
                 <ResponsiveContainer width="100%" height="100%">
-                  <LineChart data={telemetry}>
+                  <LineChart data={chartTelemetry}>
                     <CartesianGrid strokeDasharray="3 3" stroke="#334155" />
                     <XAxis dataKey="time" stroke="#94a3b8" />
                     <YAxis yAxisId="left" stroke="#38bdf8" />

@@ -82,6 +82,7 @@ export default function AdminAccess({ api, catalog, devices, refreshDevices, ope
   const [role, setRole] = useState('VIEWER');
   const [grants, setGrants] = useState({});
   const [provisioned, setProvisioned] = useState(null);
+  const grantableDevices = catalog.filter(device => device.lifecycle_status !== 'DECOMMISSIONED');
 
   useEffect(() => {
     const controller = new AbortController();
@@ -119,7 +120,7 @@ export default function AdminAccess({ api, catalog, devices, refreshDevices, ope
     event.preventDefault();
     const form = event.currentTarget;
     const fields = Object.fromEntries(new FormData(form));
-    const device_grants = role === 'ADMIN' ? [] : catalog
+    const device_grants = role === 'ADMIN' ? [] : grantableDevices
       .filter(device => grants[device.id])
       .map(device => ({ device_id: device.id, permission: grants[device.id] }));
     run(async () => {
@@ -195,10 +196,10 @@ export default function AdminAccess({ api, catalog, devices, refreshDevices, ope
                 <option value="ADMIN">ADMIN</option>
               </select>
             </label>
-            {role !== 'ADMIN' && catalog.length > 0 && (
+            {role !== 'ADMIN' && grantableDevices.length > 0 && (
               <fieldset className="max-h-64 space-y-2 overflow-y-auto rounded border border-slate-800 p-3">
                 <legend className="px-2 text-sm">Quyền theo node</legend>
-                {catalog.map(device => (
+                {grantableDevices.map(device => (
                   <div key={device.id} className="grid items-center gap-2 sm:grid-cols-2">
                     <label className="flex items-center gap-2 text-sm">
                       <input type="checkbox" checked={Boolean(grants[device.id])}
@@ -233,11 +234,11 @@ export default function AdminAccess({ api, catalog, devices, refreshDevices, ope
             <label className="block text-sm">Node
               <select name="device_id" defaultValue="" required className={input}>
                 <option value="" disabled>Chọn node</option>
-                {catalog.map(device => <option key={device.id} value={device.id}>{device.device_name} ({device.device_code})</option>)}
+                {grantableDevices.map(device => <option key={device.id} value={device.id}>{device.device_name} ({device.device_code})</option>)}
               </select>
             </label>
             <label className="block text-sm">Mức quyền<PermissionSelect name="permission" /></label>
-            <button className={button} disabled={busy || !data.users.length || !catalog.length}>Cấp quyền</button>
+            <button className={button} disabled={busy || !data.users.length || !grantableDevices.length}>Cấp quyền</button>
           </form>
         </section>
 

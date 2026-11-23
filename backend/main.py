@@ -4,6 +4,7 @@ import json
 import time
 import asyncio
 import secrets
+import threading
 from contextlib import closing
 from datetime import datetime, timedelta
 from typing import Annotated, Literal, Optional
@@ -17,7 +18,7 @@ from dotenv import load_dotenv
 from fastapi import FastAPI, Depends, HTTPException, Query, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints, field_validator
 
@@ -103,6 +104,8 @@ def log_audit(user_id: Optional[int], action: str, target: str, details: str, ip
 mqtt_client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
 last_saved_cache = {}
 last_retention_cleanup = {}
+live_telemetry = {}
+live_telemetry_lock = threading.Lock()
 
 async def send_telegram_notifications(notifications):
     await asyncio.gather(*(send_telegram_alert(*notification) for notification in notifications))
@@ -197,6 +200,23 @@ def on_message(client, userdata, msg):
                     print(f"[VALIDATION] Du lieu bat thuong bi tu choi: temp={temp}, hum={hum}, eco2={eco2}")
                     conn.close()
                     return
+
+                # Preserve every valid MQTT sample for the live dashboard. Database
+                # writes are intentionally throttled below, so they are not a live feed.
+                with live_telemetry_lock:
+                    previous_live = live_telemetry.get(device_code)
+                    sequence = (previous_live["sequence"] if previous_live else 0) + 1
+                    live_telemetry[device_code] = {
+                        "sequence": sequence,
+                        "sample": {
+                            "recorded_at": datetime.now().isoformat(timespec="seconds"),
+                            "temperature": temp,
+                            "humidity": hum,
+                            "eco2": eco2,
+                            "tvoc": tvoc,
+                            "fan_state": fan_state,
+                        },
+                    }
 
                 now_ts = time.time()
                 prev = last_saved_cache.get(device_code)
@@ -624,7 +644,7 @@ def list_device_catalog(user: dict = Depends(get_current_user), conn=Depends(get
         if user["role"] == "ADMIN":
             cursor.execute(
                 f"""SELECT {fields}, 'APPROVED' AS access_status, 'CONTROL' AS permission
-                    FROM devices d WHERE d.lifecycle_status <> 'DECOMMISSIONED' ORDER BY d.id"""
+                    FROM devices d ORDER BY d.id"""
             )
         else:
             cursor.execute(
@@ -832,6 +852,32 @@ def get_telemetry(
         )
         rows = cursor.fetchall()
     return list(reversed(rows))
+
+@app.get("/api/devices/{device_code}/live")
+async def stream_device_telemetry(
+    request: Request,
+    device: dict = Depends(verify_device_access()),
+):
+    """Stream the newest validated MQTT sample without waiting for DB persistence."""
+    device_code = device["device_code"]
+
+    async def events():
+        last_sequence = 0
+        while not await request.is_disconnected():
+            with live_telemetry_lock:
+                current = live_telemetry.get(device_code)
+            if current and current["sequence"] != last_sequence:
+                last_sequence = current["sequence"]
+                yield f"id: {last_sequence}\nevent: telemetry\ndata: {json.dumps(current)}\n\n"
+            else:
+                yield ": keep-alive\n\n"
+            await asyncio.sleep(0.25)
+
+    return StreamingResponse(
+        events(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
 
 @app.post("/api/devices/{device_code}/command")
 def send_command(
