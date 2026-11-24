@@ -452,7 +452,11 @@ PermissionNote = Annotated[str, StringConstraints(strip_whitespace=True, max_len
 def enforce_permission(device, user, required_permission: Permission):
     if user["role"] == "ADMIN":
         return
-    if device["lifecycle_status"] == "DECOMMISSIONED" or device["access_status"] != "APPROVED":
+    if device["lifecycle_status"] == "DECOMMISSIONED":
+        raise HTTPException(status_code=403, detail="Thiết bị này đã ngừng hoạt động")
+    if device.get("visibility") == "PUBLIC" and required_permission == "VIEW":
+        return
+    if device["access_status"] != "APPROVED":
         raise HTTPException(status_code=403, detail="Bạn chưa được cấp quyền truy cập thiết bị này")
     if required_permission == "CONTROL" and device["permission"] != "CONTROL":
         raise HTTPException(status_code=403, detail="Bạn chỉ có quyền xem, không có quyền điều khiển thiết bị này")
@@ -462,7 +466,7 @@ def verify_device_access(required_permission: Permission = "VIEW"):
     def check_access(device_code: str, user: dict = Depends(get_current_user), conn=Depends(get_api_db)):
         with conn.cursor() as cursor:
             cursor.execute(
-                """SELECT d.id, d.device_code, d.lifecycle_status, d.tvoc_threshold,
+                """SELECT d.id, d.device_code, d.lifecycle_status, d.visibility, d.tvoc_threshold,
                           p.status AS access_status, p.permission
                    FROM devices d
                    LEFT JOIN device_permissions p ON p.device_id = d.id AND p.user_id = %s
@@ -483,6 +487,17 @@ class LoginRequest(BaseModel):
     username: str
     password: str
 
+class ChangePasswordRequest(BaseModel):
+    current_password: Annotated[str, StringConstraints(min_length=1)]
+    new_password: Annotated[str, StringConstraints(min_length=8)]
+
+    @field_validator("current_password", "new_password")
+    @classmethod
+    def validate_password_size(cls, password: str) -> str:
+        if len(password.encode("utf-8")) > 72:
+            raise ValueError("Mật khẩu tối đa 72 byte UTF-8")
+        return password
+
 class CommandRequest(BaseModel):
     target: str = "FAN_RELAY"
     action: str
@@ -496,8 +511,28 @@ class ConfigRequest(BaseModel):
 class LifecycleRequest(BaseModel):
     lifecycle_status: Literal["REGISTERED", "PROVISIONED", "ACTIVE", "OFFLINE", "MAINTENANCE", "DECOMMISSIONED"]
 
+class OnboardUserPermission(BaseModel):
+    user_id: DeviceId
+    permission: Literal["NONE", "VIEW", "CONTROL"]
+
+
 class OnboardDeviceRequest(BaseModel):
     device_code: DeviceCode
+    device_name: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=100)]
+    location: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=100)]
+    visibility: Literal["PUBLIC", "PRIVATE"] = "PRIVATE"
+    user_permissions: list["OnboardUserPermission"] = Field(default_factory=list)
+
+    @field_validator("user_permissions")
+    @classmethod
+    def validate_unique_user_permissions(cls, value):
+        ids = [entry.user_id for entry in value]
+        if len(ids) != len(set(ids)):
+            raise ValueError("Mỗi tài khoản chỉ được chọn một lần")
+        return value
+
+
+class DeviceInfoRequest(BaseModel):
     device_name: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=100)]
     location: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=100)]
 
@@ -578,6 +613,32 @@ def current_account(user: dict = Depends(get_current_user)):
     return user
 
 
+@app.put("/api/auth/change-password")
+def change_password(
+    req: ChangePasswordRequest,
+    user: dict = Depends(get_current_user),
+    conn=Depends(get_api_db),
+):
+    with conn.cursor() as cursor:
+        cursor.execute(
+            "SELECT password_hash FROM users WHERE id = %s AND is_active = 1 FOR UPDATE",
+            (user["user_id"],),
+        )
+        account = cursor.fetchone()
+        if not account:
+            raise HTTPException(status_code=401, detail="Tài khoản không hoạt động")
+        if not bcrypt.checkpw(req.current_password.encode("utf-8"), account["password_hash"].encode("utf-8")):
+            raise HTTPException(status_code=400, detail="Mật khẩu hiện tại không đúng")
+        if bcrypt.checkpw(req.new_password.encode("utf-8"), account["password_hash"].encode("utf-8")):
+            raise HTTPException(status_code=400, detail="Mật khẩu mới phải khác mật khẩu hiện tại")
+
+        password_hash = bcrypt.hashpw(req.new_password.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
+        cursor.execute("UPDATE users SET password_hash = %s WHERE id = %s", (password_hash, user["user_id"]))
+    conn.commit()
+    log_audit(user["user_id"], "CHANGE_PASSWORD", f"USER:{user['username']}", "Người dùng đổi mật khẩu")
+    return {"message": "Đổi mật khẩu thành công."}
+
+
 def select_grantable_device(cursor, device_id: int):
     cursor.execute("SELECT lifecycle_status FROM devices WHERE id = %s FOR UPDATE", (device_id,))
     device = cursor.fetchone()
@@ -638,7 +699,7 @@ def list_grantable_users(admin: dict = Depends(require_admin), conn=Depends(get_
 
 @app.get("/api/devices/catalog")
 def list_device_catalog(user: dict = Depends(get_current_user), conn=Depends(get_api_db)):
-    fields = "d.id, d.device_code, d.device_name, d.location, d.lifecycle_status"
+    fields = "d.id, d.device_code, d.device_name, d.location, d.lifecycle_status, d.visibility"
     with conn.cursor() as cursor:
         if user["role"] == "ADMIN":
             cursor.execute(
@@ -647,10 +708,15 @@ def list_device_catalog(user: dict = Depends(get_current_user), conn=Depends(get
             )
         else:
             cursor.execute(
-                f"""SELECT {fields}, p.status AS access_status, p.permission
+                f"""SELECT {fields},
+                           CASE WHEN d.visibility = 'PUBLIC' THEN 'APPROVED' ELSE p.status END AS access_status,
+                           CASE WHEN d.visibility = 'PUBLIC' AND NOT (p.status = 'APPROVED' AND p.permission = 'CONTROL')
+                                THEN 'VIEW' ELSE p.permission END AS permission,
+                           CASE WHEN p.status = 'PENDING' THEN 'PENDING' ELSE NULL END AS request_status
                     FROM devices d
                     LEFT JOIN device_permissions p ON p.device_id = d.id AND p.user_id = %s
-                    WHERE d.lifecycle_status <> 'DECOMMISSIONED' ORDER BY d.id""",
+                    WHERE d.lifecycle_status <> 'DECOMMISSIONED'
+                      AND (d.visibility = 'PUBLIC' OR p.status = 'APPROVED') ORDER BY d.id""",
                 (user["user_id"],),
             )
         return cursor.fetchall()
@@ -661,14 +727,23 @@ def request_device_permission(req: AccessRequest, user: dict = Depends(get_curre
     if user["role"] == "ADMIN":
         raise HTTPException(status_code=400, detail="Admin đã có quyền truy cập mọi node")
     with conn.cursor() as cursor:
-        select_grantable_device(cursor, req.device_id)
+        cursor.execute("SELECT visibility, lifecycle_status FROM devices WHERE id = %s FOR UPDATE", (req.device_id,))
+        target = cursor.fetchone()
+        if not target or target["lifecycle_status"] == "DECOMMISSIONED":
+            raise HTTPException(status_code=404, detail="Không tìm thấy node đang hoạt động")
+        if target["visibility"] != "PUBLIC":
+            raise HTTPException(status_code=403, detail="Node riêng tư chỉ nhận quyền do admin cấp")
+        if req.requested_permission != "CONTROL":
+            raise HTTPException(status_code=400, detail="Node công khai đã cho phép xem; chỉ cần xin quyền điều khiển")
         cursor.execute(
-            "SELECT id, status FROM device_permissions WHERE user_id = %s AND device_id = %s FOR UPDATE",
+            "SELECT id, status, permission FROM device_permissions WHERE user_id = %s AND device_id = %s FOR UPDATE",
             (user["user_id"], req.device_id),
         )
         existing = cursor.fetchone()
-        if existing and existing["status"] != "REJECTED":
+        if existing and existing["status"] == "PENDING":
             raise HTTPException(status_code=400, detail="Bạn đã có quyền hoặc đang có yêu cầu chờ duyệt cho thiết bị này")
+        if existing and existing["status"] == "APPROVED" and existing.get("permission") == "CONTROL":
+            raise HTTPException(status_code=400, detail="Bạn đã có quyền điều khiển node này")
         if existing:
             permission_id = existing["id"]
             cursor.execute(
@@ -779,8 +854,8 @@ def approved_device_scope(user):
     if user["role"] == "ADMIN":
         return "", "1 = 1", ()
     return (
-        "JOIN device_permissions p ON p.device_id = d.id",
-        "p.user_id = %s AND p.status = 'APPROVED' AND d.lifecycle_status <> 'DECOMMISSIONED'",
+        "LEFT JOIN device_permissions p ON p.device_id = d.id AND p.user_id = %s",
+        "d.lifecycle_status <> 'DECOMMISSIONED' AND (d.visibility = 'PUBLIC' OR p.status = 'APPROVED')",
         (user["user_id"],),
     )
 
@@ -788,10 +863,10 @@ def approved_device_scope(user):
 @app.get("/api/devices")
 def list_devices(user: dict = Depends(get_current_user), conn=Depends(get_api_db)):
     join, where, params = approved_device_scope(user)
-    permission = "'CONTROL'" if user["role"] == "ADMIN" else "p.permission"
+    permission = "'CONTROL'" if user["role"] == "ADMIN" else "CASE WHEN d.visibility = 'PUBLIC' AND NOT (p.status = 'APPROVED' AND p.permission = 'CONTROL') THEN 'VIEW' ELSE p.permission END"
     with conn.cursor() as cursor:
         cursor.execute(
-            f"""SELECT d.id, d.device_code, d.device_name, d.location, d.owner_id, d.hardware_version,
+            f"""SELECT d.id, d.device_code, d.device_name, d.location, d.visibility, d.owner_id, d.hardware_version,
                        d.firmware_version, d.lifecycle_status, d.is_online, d.send_interval_ms, d.eco2_threshold,
                        d.tvoc_threshold, d.temp_threshold, d.last_seen_at, d.created_at, {permission} AS permission
                 FROM devices d {join} WHERE {where} ORDER BY d.id""",
@@ -805,17 +880,61 @@ def onboard_device(req: OnboardDeviceRequest, user: dict = Depends(require_admin
     try:
         with conn.cursor() as cursor:
             cursor.execute(
-                """INSERT INTO devices (device_code, device_name, secret_token, location, owner_id, lifecycle_status)
-                   VALUES (%s, %s, %s, %s, %s, 'PROVISIONED')""",
-                (req.device_code, req.device_name, secret_token, req.location, user["user_id"])
+                """INSERT INTO devices (device_code, device_name, secret_token, location, owner_id, lifecycle_status, visibility)
+                   VALUES (%s, %s, %s, %s, %s, 'PROVISIONED', %s)""",
+                (req.device_code, req.device_name, secret_token, req.location, user["user_id"], req.visibility)
             )
+            device_id = cursor.lastrowid
+            if req.visibility == "PRIVATE":
+                for grant in req.user_permissions:
+                    if grant.permission == "NONE":
+                        continue
+                    cursor.execute("SELECT role, is_active FROM users WHERE id = %s FOR UPDATE", (grant.user_id,))
+                    target_user = cursor.fetchone()
+                    if not target_user or not target_user["is_active"] or target_user["role"] == "ADMIN":
+                        raise HTTPException(status_code=422, detail="Danh sách có tài khoản không hợp lệ")
+                    cursor.execute(
+                        """INSERT INTO device_permissions (user_id, device_id, permission, status, granted_by, granted_at)
+                           VALUES (%s, %s, %s, 'APPROVED', %s, NOW())""",
+                        (grant.user_id, device_id, grant.permission, user["user_id"]),
+                    )
+            elif req.user_permissions:
+                raise HTTPException(status_code=422, detail="Không gửi quyền theo user cho node công khai")
         conn.commit()
     except pymysql.IntegrityError as exc:
         if exc.args[0] != 1062:
             raise
         raise HTTPException(status_code=409, detail="Mã thiết bị đã tồn tại") from exc
     log_audit(user["user_id"], "ONBOARD_DEVICE", f"DEVICE:{req.device_code}", "Dang ky va cap token cho thiet bi moi")
-    return {"message": "Dang ky thiet bi thanh cong", "device_code": req.device_code, "secret_token": secret_token}
+    return {"message": "Dang ky thiet bi thanh cong", "device_code": req.device_code, "visibility": req.visibility, "secret_token": secret_token}
+
+@app.put("/api/devices/{device_code}/info")
+def update_device_info(
+    device_code: str,
+    req: DeviceInfoRequest,
+    user: dict = Depends(require_admin),
+    conn=Depends(get_api_db),
+):
+    with conn.cursor() as cursor:
+        cursor.execute("SELECT id, device_name, location FROM devices WHERE device_code = %s FOR UPDATE", (device_code,))
+        device = cursor.fetchone()
+        if not device:
+            raise HTTPException(status_code=404, detail="Không tìm thấy thiết bị")
+        cursor.execute(
+            "UPDATE devices SET device_name = %s, location = %s WHERE id = %s",
+            (req.device_name, req.location, device["id"]),
+        )
+    conn.commit()
+    log_audit(
+        user["user_id"], "UPDATE_DEVICE_INFO", f"DEVICE:{device_code}",
+        f"Tên: '{device['device_name']}' → '{req.device_name}'; "
+        f"vị trí: '{device['location']}' → '{req.location}'",
+    )
+    return {
+        "message": "Đã cập nhật thông tin thiết bị.",
+        "device_name": req.device_name,
+        "location": req.location,
+    }
 
 @app.put("/api/devices/{device_code}/lifecycle")
 def change_device_lifecycle(device_code: str, req: LifecycleRequest, user: dict = Depends(require_admin), conn=Depends(get_api_db)):
@@ -979,6 +1098,8 @@ def update_remote_config(
 @app.get("/api/commands")
 def list_commands(user: dict = Depends(get_current_user), conn=Depends(get_api_db)):
     join, where, params = approved_device_scope(user)
+    if user["role"] != "ADMIN":
+        where += " AND (d.visibility = 'PRIVATE' OR p.status = 'APPROVED')"
     with conn.cursor() as cursor:
         cursor.execute(
             f"""SELECT c.*, u.username FROM command_logs c

@@ -21,6 +21,7 @@ CREATE TABLE IF NOT EXISTS devices (
     device_name VARCHAR(100) NOT NULL,
     secret_token VARCHAR(255) NOT NULL,
     location VARCHAR(100) NOT NULL,
+    visibility ENUM('PUBLIC', 'PRIVATE') NOT NULL DEFAULT 'PRIVATE',
     owner_id INT,
     hardware_version VARCHAR(30) DEFAULT 'ESP32-WROOM-32',
     firmware_version VARCHAR(20) DEFAULT 'v1.0.0',

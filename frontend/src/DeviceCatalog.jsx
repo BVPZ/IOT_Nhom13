@@ -23,7 +23,7 @@ function RequestDialog({ device, api, onClose, onRequested }) {
     try {
       await api.post('/permissions/request', {
         device_id: device.id,
-        requested_permission: fields.get('permission'),
+        requested_permission: device.visibility === 'PUBLIC' ? 'CONTROL' : fields.get('permission'),
         request_note: fields.get('note').trim() || null,
       });
       onRequested();
@@ -38,12 +38,12 @@ function RequestDialog({ device, api, onClose, onRequested }) {
       className="m-auto w-full max-w-md rounded-lg border border-slate-700 bg-slate-900 p-6 text-slate-100 backdrop:bg-slate-950/80">
       <h2 id="request-title" className="mb-4 text-lg font-semibold">Xin quyền truy cập {device.device_name}</h2>
       <form onSubmit={submit} className="space-y-4">
-        <label className="block text-sm">
+        {device.visibility !== 'PUBLIC' && <label className="block text-sm">
           Mức quyền
           <select name="permission" className="mt-1 block w-full rounded border border-slate-700 bg-slate-950 p-2">
             {Object.entries(permissions).map(([value, label]) => <option key={value} value={value}>{label}</option>)}
           </select>
-        </label>
+        </label>}
         <label className="block text-sm">
           Ghi chú cho admin
           <textarea name="note" maxLength={255} rows={3} className="mt-1 block w-full rounded border border-slate-700 bg-slate-950 p-2" />
@@ -83,7 +83,14 @@ export default function DeviceCatalog({ devices, loaded, api, onOpen, onRequeste
               ) : device.access_status === 'APPROVED' ? (
                 <div className="flex flex-wrap items-center justify-between gap-2 pt-2">
                   <span className="text-sm font-medium text-teal-300">{permissions[device.permission]}</span>
-                  <button onClick={() => onOpen(device.device_code)} className={buttonClass}>Mở giám sát</button>
+                  <div className="flex flex-wrap gap-2">
+                    <button onClick={() => onOpen(device.device_code)} className={buttonClass}>Mở giám sát</button>
+                    {device.visibility === 'PUBLIC' && device.permission !== 'CONTROL' && (
+                      device.request_status === 'PENDING'
+                        ? <span className="self-center text-sm text-amber-300">Đang chờ duyệt điều khiển</span>
+                        : <button onClick={() => setRequestDevice(device)} className={buttonClass}>Xin điều khiển</button>
+                    )}
+                  </div>
                 </div>
               ) : device.access_status === 'PENDING' ? (
                 <p className="pt-2 text-sm text-amber-300">Đang chờ admin phê duyệt</p>

@@ -1,7 +1,7 @@
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   Activity, Shield, Power, Settings, AlertTriangle,
-  LogOut, Wind, Thermometer, Droplets, Cloud, Lock, Server, Wifi
+  KeyRound, LogOut, Wind, Thermometer, Droplets, Cloud, Lock, Server, Wifi
 } from 'lucide-react';
 import {
   LineChart, Line, XAxis, YAxis, CartesianGrid,
@@ -36,6 +36,82 @@ function NavigationTab({ active, onClick, children }) {
     className={`flex shrink-0 items-center gap-2 border-b-2 py-3 ${color}`}>{children}</button>;
 }
 
+function ChangePasswordDialog({ api, onClose, onSuccess }) {
+  const dialog = useRef(null);
+  const [currentPassword, setCurrentPassword] = useState('');
+  const [newPassword, setNewPassword] = useState('');
+  const [confirmPassword, setConfirmPassword] = useState('');
+  const [error, setError] = useState('');
+  const [busy, setBusy] = useState(false);
+
+  useEffect(() => {
+    const element = dialog.current;
+    element.showModal();
+    return () => element.close();
+  }, []);
+
+  async function submit(event) {
+    event.preventDefault();
+    setError('');
+    if (newPassword !== confirmPassword) {
+      setError('Mật khẩu mới và phần xác nhận không trùng nhau.');
+      return;
+    }
+    if (new TextEncoder().encode(newPassword).length > 72) {
+      setError('Mật khẩu mới không được vượt quá 72 byte UTF-8.');
+      return;
+    }
+
+    setBusy(true);
+    try {
+      const response = await api.put('/auth/change-password', {
+        current_password: currentPassword,
+        new_password: newPassword,
+      });
+      onSuccess(response.data.message);
+    } catch (requestError) {
+      setError(apiError(requestError, 'Không thể đổi mật khẩu.'));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <dialog ref={dialog} onCancel={onClose}
+      className="m-auto w-full max-w-md rounded-lg border border-slate-700 bg-slate-900 p-6 text-slate-100 backdrop:bg-slate-950/80">
+      <h2 className="mb-4 text-lg font-semibold">Đổi mật khẩu</h2>
+      <form onSubmit={submit} className="space-y-4">
+        <label className="block text-sm">
+          Mật khẩu hiện tại
+          <input type="password" autoComplete="current-password" required value={currentPassword}
+            onChange={event => setCurrentPassword(event.target.value)}
+            className="mt-1 block w-full rounded border border-slate-700 bg-slate-950 p-2" />
+        </label>
+        <label className="block text-sm">
+          Mật khẩu mới
+          <input type="password" autoComplete="new-password" minLength={8} required value={newPassword}
+            onChange={event => setNewPassword(event.target.value)}
+            className="mt-1 block w-full rounded border border-slate-700 bg-slate-950 p-2" />
+        </label>
+        <label className="block text-sm">
+          Xác nhận mật khẩu mới
+          <input type="password" autoComplete="new-password" minLength={8} required value={confirmPassword}
+            onChange={event => setConfirmPassword(event.target.value)}
+            className="mt-1 block w-full rounded border border-slate-700 bg-slate-950 p-2" />
+        </label>
+        {error && <p role="alert" className="text-sm text-red-300">{error}</p>}
+        <div className="flex justify-end gap-3">
+          <button type="button" disabled={busy} onClick={onClose}
+            className="rounded border border-slate-700 px-3 py-2 text-sm">Hủy</button>
+          <button disabled={busy} className="rounded bg-teal-600 px-3 py-2 text-sm text-white disabled:opacity-50">
+            {busy ? 'Đang lưu…' : 'Đổi mật khẩu'}
+          </button>
+        </div>
+      </form>
+    </dialog>
+  );
+}
+
 export default function App() {
   const [token, setToken] = useState(() => localStorage.getItem('token') || '');
 
@@ -64,12 +140,15 @@ function Dashboard({ token, onLogout }) {
   const [activeTab, setActiveTab] = useState('catalog');
   const [selectedDevice, setSelectedDevice] = useState('');
   const [details, setDetails] = useState(null);
+  const [changePasswordOpen, setChangePasswordOpen] = useState(false);
   const [liveSamples, setLiveSamples] = useState([]);
   const [liveStatus, setLiveStatus] = useState('connecting');
   const [auditLogs, setAuditLogs] = useState([]);
   const [actionMsg, setActionMsg] = useState('');
   const [revision, setRevision] = useState(0);
   const [configEdits, setConfigEdits] = useState({});
+  const [deviceNameEdit, setDeviceNameEdit] = useState('');
+  const [deviceLocationEdit, setDeviceLocationEdit] = useState('');
   const refreshDevices = useCallback(() => setRevision(value => value + 1), []);
 
   useEffect(() => {
@@ -83,6 +162,11 @@ function Dashboard({ token, onLogout }) {
     ? devices.map(device => ({ ...device, access_status: 'APPROVED', permission: 'CONTROL' }))
     : catalog;
   const currentDev = devices.find(device => device.device_code === selectedDevice);
+  useEffect(() => {
+    setDeviceNameEdit(currentDev?.device_name || '');
+    setDeviceLocationEdit(currentDev?.location || '');
+  }, [selectedDevice, currentDev?.device_name, currentDev?.location]);
+
   const tab = (DETAIL_TABS.includes(activeTab) && !currentDev)
     || (['admin', 'audit'].includes(activeTab) && !isAdmin) ? 'catalog' : activeTab;
   const canControl = currentDev?.permission === 'CONTROL';
@@ -306,6 +390,25 @@ function Dashboard({ token, onLogout }) {
     }, 'Không thể đổi trạng thái thiết bị.');
   }
 
+  function handleUpdateDeviceInfo(event) {
+    event.preventDefault();
+    if (!isAdmin || !currentDev) return;
+    const deviceName = deviceNameEdit.trim();
+    const location = deviceLocationEdit.trim();
+    if (!deviceName || !location
+      || (deviceName === currentDev.device_name && location === currentDev.location)) return;
+
+    return perform(async () => {
+      const response = await api.put(`${devicePath}/info`, { device_name: deviceName, location });
+      setDevices(items => items.map(item => item.device_code === selectedDevice
+        ? { ...item, device_name: response.data.device_name, location: response.data.location }
+        : item));
+      setDeviceNameEdit(response.data.device_name);
+      setDeviceLocationEdit(response.data.location);
+      setActionMsg(response.data.message);
+    }, 'Không thể cập nhật thông tin thiết bị.');
+  }
+
   function handleAckAlert(id) {
     if (!canControl) return;
     return perform(async () => {
@@ -343,6 +446,12 @@ function Dashboard({ token, onLogout }) {
               </span>
             </div>
           </div>
+          <button
+            onClick={() => setChangePasswordOpen(true)}
+            className="flex items-center gap-2 rounded border border-slate-700 px-3 py-2 text-sm text-slate-300 hover:bg-slate-800 hover:text-white"
+          >
+            <KeyRound className="h-4 w-4" /> Đổi mật khẩu
+          </button>
           <button 
             onClick={onLogout}
             className="p-2 hover:bg-slate-800 rounded text-slate-400 hover:text-white"
@@ -352,6 +461,17 @@ function Dashboard({ token, onLogout }) {
           </button>
         </div>
       </header>
+
+      {changePasswordOpen && (
+        <ChangePasswordDialog
+          api={api}
+          onClose={() => setChangePasswordOpen(false)}
+          onSuccess={message => {
+            setChangePasswordOpen(false);
+            setActionMsg(message);
+          }}
+        />
+      )}
 
       {/* Action Notification Toast */}
       {actionMsg && (
@@ -607,6 +727,47 @@ function Dashboard({ token, onLogout }) {
                 </fieldset>
               </form>
             </div>
+
+            {isAdmin && (
+              <div className="bg-slate-900 border border-slate-800 p-6 rounded-lg space-y-4 md:col-span-2">
+                <h2 className="text-base font-semibold text-white flex items-center gap-2">
+                  <Settings className="w-5 h-5 text-teal-400" /> Đổi thông tin thiết bị
+                </h2>
+                <form onSubmit={handleUpdateDeviceInfo} className="grid gap-3 sm:grid-cols-[1fr_1fr_auto] items-end">
+                  <label className="block text-sm text-slate-400">
+                    Tên thiết bị
+                    <input
+                      type="text"
+                      value={deviceNameEdit}
+                      onChange={event => setDeviceNameEdit(event.target.value)}
+                      maxLength={100}
+                      required
+                      className="w-full mt-1 p-2 bg-slate-800 border border-slate-700 rounded text-white"
+                    />
+                  </label>
+                  <label className="block text-sm text-slate-400">
+                    Vị trí thiết bị
+                    <input
+                      type="text"
+                      value={deviceLocationEdit}
+                      onChange={event => setDeviceLocationEdit(event.target.value)}
+                      maxLength={100}
+                      required
+                      className="w-full mt-1 p-2 bg-slate-800 border border-slate-700 rounded text-white"
+                    />
+                  </label>
+                  <button
+                    type="submit"
+                    disabled={!deviceNameEdit.trim() || !deviceLocationEdit.trim()
+                      || (deviceNameEdit.trim() === currentDev.device_name
+                        && deviceLocationEdit.trim() === currentDev.location)}
+                    className="px-4 py-2 bg-teal-600 hover:bg-teal-700 text-white rounded text-sm disabled:opacity-50"
+                  >
+                    Lưu thông tin
+                  </button>
+                </form>
+              </div>
+            )}
 
             {/* Khối Quản lý Vòng đời (Chỉ Admin) */}
             {isAdmin && (

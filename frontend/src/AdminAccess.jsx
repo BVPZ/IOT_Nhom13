@@ -159,6 +159,8 @@ export default function AdminAccess({ api, catalog, devices, refreshDevices, ope
   const [busy, setBusy] = useState(false);
   const [grants, setGrants] = useState({});
   const [provisioned, setProvisioned] = useState(null);
+  const [newDeviceVisibility, setNewDeviceVisibility] = useState('PRIVATE');
+  const [newDevicePermissions, setNewDevicePermissions] = useState({});
   const grantableDevices = catalog.filter(device => device.lifecycle_status !== 'DECOMMISSIONED');
 
   useEffect(() => {
@@ -222,10 +224,16 @@ export default function AdminAccess({ api, catalog, devices, refreshDevices, ope
     event.preventDefault();
     const form = event.currentTarget;
     const fields = Object.fromEntries(new FormData(form));
+    fields.visibility = newDeviceVisibility;
+    fields.user_permissions = newDeviceVisibility === 'PRIVATE'
+      ? data.users.map(account => ({ user_id: account.id, permission: newDevicePermissions[account.id] || 'NONE' }))
+      : [];
     run(async () => {
       const response = await api.post('/devices/onboard', fields);
       setProvisioned(response.data);
       form.reset();
+      setNewDeviceVisibility('PRIVATE');
+      setNewDevicePermissions({});
       refreshDevices();
     }, 'Đã thêm node.');
   }
@@ -316,6 +324,30 @@ export default function AdminAccess({ api, catalog, devices, refreshDevices, ope
             <TextField label="Mã node" name="device_code" maxLength={50} pattern="[A-Za-z0-9_\-]+" />
             <TextField label="Tên node" name="device_name" maxLength={100} />
             <TextField label="Vị trí" name="location" maxLength={100} />
+            <label className="block text-sm">Phạm vi truy cập
+              <select value={newDeviceVisibility} onChange={event => setNewDeviceVisibility(event.target.value)} className={input}>
+                <option value="PUBLIC">Công khai (PUBLIC)</option>
+                <option value="PRIVATE">Riêng tư (PRIVATE)</option>
+              </select>
+            </label>
+            {newDeviceVisibility === 'PRIVATE' && (
+              <fieldset className="max-h-72 space-y-2 overflow-y-auto rounded border border-slate-800 p-3">
+                <legend className="px-2 text-sm">Quyền truy cập theo tài khoản</legend>
+                {data.users.length === 0 ? <p className="text-sm text-slate-400">Chưa có tài khoản để cấp quyền.</p> :
+                  data.users.map(account => (
+                    <label key={account.id} className="grid items-center gap-2 text-sm sm:grid-cols-[1fr_12rem]">
+                      <span>{account.full_name} <span className="text-slate-400">({account.username})</span></span>
+                      <select aria-label={`Quyền của ${account.username}`} value={newDevicePermissions[account.id] || 'NONE'}
+                        onChange={event => setNewDevicePermissions(current => ({ ...current, [account.id]: event.target.value }))}
+                        className={input}>
+                        <option value="NONE">Không</option>
+                        <option value="VIEW">Chỉ xem</option>
+                        <option value="CONTROL">Điều khiển</option>
+                      </select>
+                    </label>
+                  ))}
+              </fieldset>
+            )}
             <button className={button} disabled={busy}>Thêm node</button>
           </form>
           {provisioned && (

@@ -1,6 +1,9 @@
 import axios from 'axios';
 
-const baseURL = (import.meta.env.VITE_API_BASE_URL || 'https://iot-air-backend.onrender.com') + '/api';
+const defaultApiBaseURL = import.meta.env.DEV
+  ? 'http://127.0.0.1:8000'
+  : 'https://iot-air-backend.onrender.com';
+const baseURL = (import.meta.env.VITE_API_BASE_URL || defaultApiBaseURL) + '/api';
 
 export function createApi(token) {
   return axios.create({
