@@ -71,6 +71,13 @@ function Dashboard({ token, onLogout }) {
   const [revision, setRevision] = useState(0);
   const [configEdits, setConfigEdits] = useState({});
   const refreshDevices = useCallback(() => setRevision(value => value + 1), []);
+
+  useEffect(() => {
+    if (!actionMsg) return undefined;
+    const timeout = window.setTimeout(() => setActionMsg(''), 5000);
+    return () => window.clearTimeout(timeout);
+  }, [actionMsg]);
+
   const isAdmin = account?.role === 'ADMIN';
   const visibleCatalog = isAdmin
     ? devices.map(device => ({ ...device, access_status: 'APPROVED', permission: 'CONTROL' }))

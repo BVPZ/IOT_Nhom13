@@ -72,6 +72,84 @@ function PermissionTable({ title, entries, emptyMessage, pending, busy, onReview
   );
 }
 
+function ApprovedPermissionTable({ entries, emptyMessage, busy, onChange, onRevoke }) {
+  const [selectedGrantIds, setSelectedGrantIds] = useState({});
+  const users = [...entries.reduce((grouped, entry) => {
+    if (!grouped.has(entry.user_id)) {
+      grouped.set(entry.user_id, {
+        user_id: entry.user_id,
+        username: entry.username,
+        full_name: entry.full_name,
+        grants: [],
+      });
+    }
+    grouped.get(entry.user_id).grants.push(entry);
+    return grouped;
+  }, new Map()).values()];
+
+  return (
+    <section className={panel}>
+      <h2 className="font-semibold">Quyền đã cấp</h2>
+      {users.length > 0 ? (
+        <div className="overflow-x-auto">
+          <table className="w-full text-left text-sm">
+            <thead className="text-slate-400">
+              <tr>
+                <th className="p-2">Tài khoản</th>
+                <th className="p-2">Node</th>
+                <th className="p-2">Mức quyền</th>
+                <th className="p-2">Thao tác</th>
+              </tr>
+            </thead>
+            <tbody className="divide-y divide-slate-800">
+              {users.map(user => {
+                const selectedGrant = user.grants.find(grant => grant.id === selectedGrantIds[user.user_id])
+                  || user.grants[0];
+                return (
+                  <tr key={user.user_id}>
+                    <td className="p-2">{user.full_name}<span className="block text-slate-400">{user.username}</span></td>
+                    <td className="p-2">
+                      <select
+                        value={selectedGrant.id}
+                        aria-label={`Node đã cấp quyền cho ${user.username}`}
+                        disabled={busy}
+                        onChange={event => setSelectedGrantIds(current => ({
+                          ...current,
+                          [user.user_id]: Number(event.target.value),
+                        }))}
+                        className={input}
+                      >
+                        {user.grants.map(grant => (
+                          <option key={grant.id} value={grant.id}>
+                            {grant.device_name} ({grant.device_code})
+                          </option>
+                        ))}
+                      </select>
+                    </td>
+                    <td className="p-2">
+                      <PermissionSelect
+                        value={selectedGrant.permission}
+                        label={`Quyền của ${user.username} trên ${selectedGrant.device_code}`}
+                        disabled={busy}
+                        onChange={event => onChange(selectedGrant.id, event.target.value)}
+                      />
+                    </td>
+                    <td className="p-2">
+                      <button className={secondary} disabled={busy} onClick={() => onRevoke(selectedGrant)}>
+                        Thu hồi quyền
+                      </button>
+                    </td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
+      ) : <p className="text-sm text-slate-400">{emptyMessage}</p>}
+    </section>
+  );
+}
+
 export default function AdminAccess({ api, catalog, devices, refreshDevices, openDevice }) {
   const [data, setData] = useState({ users: [], pending: [], approved: [] });
   const [revision, setRevision] = useState(0);
@@ -79,7 +157,6 @@ export default function AdminAccess({ api, catalog, devices, refreshDevices, ope
   const [message, setMessage] = useState('');
   const [error, setError] = useState('');
   const [busy, setBusy] = useState(false);
-  const [role, setRole] = useState('VIEWER');
   const [grants, setGrants] = useState({});
   const [provisioned, setProvisioned] = useState(null);
   const grantableDevices = catalog.filter(device => device.lifecycle_status !== 'DECOMMISSIONED');
@@ -120,13 +197,12 @@ export default function AdminAccess({ api, catalog, devices, refreshDevices, ope
     event.preventDefault();
     const form = event.currentTarget;
     const fields = Object.fromEntries(new FormData(form));
-    const device_grants = role === 'ADMIN' ? [] : grantableDevices
+    const device_grants = grantableDevices
       .filter(device => grants[device.id])
       .map(device => ({ device_id: device.id, permission: grants[device.id] }));
     run(async () => {
-      await api.post('/admin/users', { ...fields, role, device_grants });
+      await api.post('/admin/users', { ...fields, device_grants });
       form.reset();
-      setRole('VIEWER');
       setGrants({});
     }, 'Đã tạo tài khoản.');
   }
@@ -174,7 +250,7 @@ export default function AdminAccess({ api, catalog, devices, refreshDevices, ope
         onReview={(entry, action, permission) => run(
           () => api.put(`/admin/permissions/${entry.id}/review`, { action, permission }), 'Đã xử lý yêu cầu.',
         )} />
-      <PermissionTable title="Quyền đã cấp" entries={data.approved} emptyMessage="Chưa có quyền được cấp." busy={busy}
+      <ApprovedPermissionTable entries={data.approved} emptyMessage="Chưa có quyền được cấp." busy={busy}
         onChange={(id, permission) => run(() => api.put(`/admin/permissions/${id}`, { permission }), 'Đã cập nhật quyền.')}
         onRevoke={revoke} />
 
@@ -188,15 +264,7 @@ export default function AdminAccess({ api, catalog, devices, refreshDevices, ope
               <TextField label="Họ tên" name="full_name" maxLength={100} />
               <TextField label="Mật khẩu" name="password" type="password" autoComplete="new-password" minLength={8} maxLength={72} />
             </div>
-            <label className="block text-sm">
-              Vai trò tài khoản
-              <select value={role} onChange={event => setRole(event.target.value)} className={input}>
-                <option value="VIEWER">VIEWER</option>
-                <option value="OPERATOR">OPERATOR</option>
-                <option value="ADMIN">ADMIN</option>
-              </select>
-            </label>
-            {role !== 'ADMIN' && grantableDevices.length > 0 && (
+            {grantableDevices.length > 0 && (
               <fieldset className="max-h-64 space-y-2 overflow-y-auto rounded border border-slate-800 p-3">
                 <legend className="px-2 text-sm">Quyền theo node</legend>
                 {grantableDevices.map(device => (

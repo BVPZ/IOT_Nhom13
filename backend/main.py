@@ -530,7 +530,6 @@ class DeviceGrant(PermissionLevel):
 
 
 class AdminAccountRequest(AccountRequest):
-    role: Role = "VIEWER"
     device_grants: list[DeviceGrant] = Field(default_factory=list)
 
 
@@ -624,7 +623,7 @@ def register(req: AccountRequest):
 
 @app.post("/api/admin/users", status_code=201)
 def admin_create_user(req: AdminAccountRequest, admin: dict = Depends(require_admin)):
-    return create_account(req, req.role, req.device_grants, admin["user_id"])
+    return create_account(req, "VIEWER", req.device_grants, admin["user_id"])
 
 
 @app.get("/api/admin/users")
