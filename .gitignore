@@ -1,5 +1,7 @@
 ﻿.env
 firmware/esp32_air_node/secrets.h
+firmware/esp32_air_node1/secrets.h
+firmware/esp32_air_node2/secrets.h
 __pycache__/
 *.pyc
 *.db
